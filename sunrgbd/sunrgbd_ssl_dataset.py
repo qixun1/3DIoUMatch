@@ -282,7 +282,7 @@ class SunrgbdSSLUnlabeledDataset(Dataset):
         rot_angle = 0
         rot_mat = np.identity(3)
         scale_ratio = np.ones((1, 3))
-        if self.augment:
+        if self.aug_num >= 1:
             if np.random.random() > 0.5:
                 # Flipping along the YZ plane
                 flip_x_axis = 1

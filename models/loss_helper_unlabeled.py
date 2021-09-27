@@ -7,6 +7,7 @@ Written by Yezhen Cong, 2020
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.ap_helper import flip_axis_to_camera
 from models.loss_helper_iou import compute_iou_labels
@@ -417,6 +418,11 @@ def get_pseudo_labels(end_points, ema_end_points, pred_center, pred_sem_cls, pre
     iou_mask = iou_pred > iou_threshold
     before_iou_mask = torch.logical_and(cls_mask, objectness_mask)
     final_mask = torch.logical_and(before_iou_mask, iou_mask)
+
+    # soft thresholding
+    # scores = pos_obj * max_cls * iou_threshold
+    # ema_end_points['scores'] = scores
+    # inds = torch.argsort(scores, dim=1, descending=True)
 
     # we only keep MAX_NUM_OBJ predictions
     # however, after filtering the number can still exceed this

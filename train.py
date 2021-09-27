@@ -14,7 +14,9 @@ import torch.optim as optim
 from torch import nn
 from torch.utils.data import DataLoader
 
+from models.loss_helper_consistency import get_consistency_loss
 from models.votenet_iou_branch import VoteNet
+import utils.ramps as ramps
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -58,6 +60,8 @@ parser.add_argument('--ema_decay',  type=float,  default=0.999, metavar='ALPHA',
                     help='ema variable decay rate')
 parser.add_argument('--unlabeled_loss_weight', type=float, default=2.0, metavar='WEIGHT',
                     help='use unlabeled loss with given weight')
+parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='WEIGHT', help='use consistency loss with given weight (default: None)')
+parser.add_argument('--consistency_rampup', type=int,  default=30,  metavar='EPOCHS', help='length of the consistency loss ramp-up')
 parser.add_argument('--use_iou_for_nms', action='store_true', help='whether use iou to guide test-time nms')
 parser.add_argument('--print_interval', type=int, default=25, help='batch interval to print loss')
 parser.add_argument('--eval_interval', type=int, default=25, help='epoch interval to evaluate model')
@@ -299,6 +303,13 @@ def tb_name(key):
     else:
         return 'other/' + key
 
+# TODO: obtain prototype using pretrained model and do the clustering sample fixed number for each class or fixed ratio
+# after getting the prototypes using method in few shot 3d semantic segmentation do label propagation on the
+# unlabelled data
+
+def get_current_consistency_weight(epoch):
+    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    return FLAGS.consistency_weight * ramps.sigmoid_rampup(epoch, FLAGS.consistency_rampup)
 
 def train_one_epoch(global_step):
     stat_dict = {}  # collect statistics
@@ -306,6 +317,7 @@ def train_one_epoch(global_step):
     bnm_scheduler.step()  # decay BN momentum
     detector.train()  # set model to training mode
     ema_detector.train()
+    consistency_weight = get_current_consistency_weight(EPOCH_CNT)
 
     unlabeled_dataloader_iterator = iter(UNLABELED_DATALOADER)
 
@@ -341,9 +353,16 @@ def train_one_epoch(global_step):
 
         detection_loss, end_points = train_labeled_criterion(end_points, DATASET_CONFIG, CONFIG_DICT)
 
-        unlabeled_loss, end_points = train_unlabeled_criterion(end_points, ema_end_points, DATASET_CONFIG, CONFIG_DICT)
+        # unlabeled_loss, end_points = train_unlabeled_criterion(end_points, ema_end_points, DATASET_CONFIG, CONFIG_DICT)
 
-        loss = detection_loss + unlabeled_loss * FLAGS.unlabeled_loss_weight
+        # TODO: add consistency loss here unlabelled data and let the weight be an argument
+        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
+        # TODO: add label propagation here using the global prototypes
+
+        # TODO: add pairwise loss on unlabelled data
+
+        loss = detection_loss + consistency_loss * consistency_weight
+        # loss = detection_loss + unlabeled_loss * FLAGS.unlabeled_loss_weight
         end_points['loss'] = loss
         loss.backward()
 

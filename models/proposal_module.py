@@ -109,6 +109,10 @@ class ProposalModule(nn.Module):
             batch_size, num_seed = end_points['seed_xyz'].shape[:2]
             sample_inds = torch.randint(0, num_seed, (batch_size, self.num_proposal), dtype=torch.int).cuda()
             xyz, features, _ = self.vote_aggregation(xyz, features, sample_inds)
+        elif self.sampling == 'ground_truth':
+            # TODO: add actual inds of votes (closest to center)
+            # create function to check if the votes are inside the bboxes
+            pass
         else:
             print('Unknown sampling strategy: %s. Exiting!' % (self.sampling))
             exit()

@@ -199,12 +199,16 @@ class PointnetSAModuleVotes(nn.Module):
         self.normalize_xyz = normalize_xyz
         self.ret_unique_cnt = ret_unique_cnt
 
+
+        # TODO: use this query to get the xyzs in the bboxes
         if npoint is not None:
             self.grouper = pointnet2_utils.QueryAndGroup(radius, nsample,
                 use_xyz=use_xyz, ret_grouped_xyz=True, normalize_xyz=normalize_xyz,
                 sample_uniformly=sample_uniformly, ret_unique_cnt=ret_unique_cnt)
         else:
             self.grouper = pointnet2_utils.GroupAll(use_xyz, ret_grouped_xyz=True)
+
+
 
         mlp_spec = mlp
         if use_xyz and len(mlp_spec)>0:
