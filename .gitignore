@@ -128,3 +128,5 @@ dmypy.json
 # Pyre type checker
 .pyre/
 /ckpts/
+/eval_*/
+/train_*/

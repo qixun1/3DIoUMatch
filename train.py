@@ -62,6 +62,7 @@ parser.add_argument('--unlabeled_loss_weight', type=float, default=2.0, metavar=
                     help='use unlabeled loss with given weight')
 parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='WEIGHT', help='use consistency loss with given weight (default: None)')
 parser.add_argument('--consistency_rampup', type=int,  default=30,  metavar='EPOCHS', help='length of the consistency loss ramp-up')
+parser.add_argument('--use_student', action='store_true', help='consistency using student side weights')
 parser.add_argument('--use_iou_for_nms', action='store_true', help='whether use iou to guide test-time nms')
 parser.add_argument('--print_interval', type=int, default=25, help='batch interval to print loss')
 parser.add_argument('--eval_interval', type=int, default=25, help='epoch interval to evaluate model')
@@ -79,6 +80,7 @@ print(FLAGS)
 print('\n************************** GLOBAL CONFIG BEG **************************')
 batch_size_list = [int(x) for x in FLAGS.batch_size.split(',')]
 BATCH_SIZE = batch_size_list[0] + batch_size_list[1]
+STUDENT = FLAGS.use_student
 NUM_POINT = FLAGS.num_point
 MAX_EPOCH = FLAGS.max_epoch
 BASE_LEARNING_RATE = FLAGS.learning_rate
@@ -309,7 +311,8 @@ def tb_name(key):
 
 def get_current_consistency_weight(epoch):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
-    return FLAGS.consistency_weight * ramps.sigmoid_rampup(epoch, FLAGS.consistency_rampup)
+    return FLAGS.consistency_weight
+    # return FLAGS.consistency_weight * ramps.sigmoid_rampup(epoch, FLAGS.consistency_rampup)
 
 def train_one_epoch(global_step):
     stat_dict = {}  # collect statistics
@@ -356,7 +359,7 @@ def train_one_epoch(global_step):
         # unlabeled_loss, end_points = train_unlabeled_criterion(end_points, ema_end_points, DATASET_CONFIG, CONFIG_DICT)
 
         # TODO: add consistency loss here unlabelled data and let the weight be an argument
-        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
+        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
         # TODO: add label propagation here using the global prototypes
 
         # TODO: add pairwise loss on unlabelled data

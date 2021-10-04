@@ -6,7 +6,7 @@ from torch import nn
 from utils.nn_distance import nn_distance
 
 
-def compute_center_consistency_loss(end_points, ema_end_points, student_weights=None, ema_weights=None):
+def compute_center_consistency_loss(end_points, ema_end_points, student_weights=None, ema_weights=None, student=False):
     center = end_points['center']  # (B, num_proposal, 3)
     ema_center = ema_end_points['center']  # (B, num_proposal, 3)
     flip_x_axis = end_points['flip_x_axis']  # (B,)
@@ -37,10 +37,14 @@ def compute_center_consistency_loss(end_points, ema_end_points, student_weights=
 
     # TODO: use both dist1 and dist2 or only use dist1
     dist = dist1 + dist2
+
+    if student:
+        return torch.mean(dist), ind1
     return torch.mean(dist), ind2
 
 
-def compute_class_consistency_loss(end_points, ema_end_points, map_ind, weight=None):
+
+def compute_class_consistency_loss(end_points, ema_end_points, map_ind, weight=None, student=False):
     cls_scores = end_points['sem_cls_scores']  # (B, num_proposal, num_class)
     ema_cls_scores = ema_end_points['sem_cls_scores']  # (B, num_proposal, num_class)
 
@@ -50,21 +54,26 @@ def compute_class_consistency_loss(end_points, ema_end_points, map_ind, weight=N
     # ema_cls_scores = ema_cls_scores * ema_end_points['scores']
     ema_cls_prob = F.softmax(ema_cls_scores, dim=2)  # (B, num_proposal, num_class)
 
-    cls_log_prob_aligned = torch.cat([torch.index_select(a, 0, i).unsqueeze(0) for a, i in zip(cls_log_prob, map_ind)])
+    if student:
+        cls_log_prob_aligned = torch.cat([torch.index_select(a, 0, i).unsqueeze(0) for a, i in zip(ema_cls_prob, map_ind)])
+        cls_prob = cls_log_prob
+    else:
+        cls_log_prob_aligned = torch.cat([torch.index_select(a, 0, i).unsqueeze(0) for a, i in zip(cls_log_prob, map_ind)])
+        cls_prob = ema_cls_prob
 
     # weighted kl divergence
     if weight is None:
-        class_consistency_loss = F.kl_div(cls_log_prob_aligned, ema_cls_prob)
+        class_consistency_loss = F.kl_div(cls_log_prob_aligned, cls_prob)
     else:
-        class_consistency_loss = F.kl_div(cls_log_prob_aligned, ema_cls_prob, reduction='none')
-        class_consistency_loss = torch.sum(class_consistency_loss, dim=-1)
+        class_consistency_loss = F.kl_div(cls_log_prob_aligned, cls_prob, reduction='none')
+        class_consistency_loss = torch.mean(class_consistency_loss, dim=-1)
         class_consistency_loss = torch.mean(weight * class_consistency_loss)
     # class_consistency_loss = F.mse_loss(cls_log_prob_aligned, ema_cls_prob)
 
     return class_consistency_loss * 2
 
 
-def compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, weight=None):
+def compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, weight=None, student=False):
     mean_size_arr = config.mean_size_arr
     mean_size_arr = torch.from_numpy(mean_size_arr.astype(np.float32)).cuda()  # (num_size_cluster,3)
     B, K = map_ind.shape
@@ -90,14 +99,19 @@ def compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, w
     ema_size = ema_size_base + ema_size_residual
     ema_size = ema_size * scale_ratio
 
-    size_aligned = torch.cat([torch.index_select(a, 0, i).unsqueeze(0) for a, i in zip(size, map_ind)])
+    if student:
+        size_aligned = torch.cat([torch.index_select(a, 0, i).unsqueeze(0) for a, i in zip(ema_size, map_ind)])
+        size = size
+    else:
+        size_aligned = torch.cat([torch.index_select(a, 0, i).unsqueeze(0) for a, i in zip(size, map_ind)])
+        size = ema_size
 
     if weight is None:
-        size_consistency_loss = F.mse_loss(size_aligned, ema_size)
+        size_consistency_loss = F.mse_loss(size_aligned, size)
     else:
         weight = weight.unsqueeze(-1)
         weight = weight.repeat(1,1,3)
-        size_consistency_loss = weighted_mse_loss(size_aligned, ema_size, weight)
+        size_consistency_loss = weighted_mse_loss(size_aligned, size, weight)
 
     return size_consistency_loss
 
@@ -106,7 +120,7 @@ def weighted_mse_loss(input, target, weight):
     return (weight * (input - target) ** 2).mean()
 
 
-def get_consistency_loss(end_points, ema_end_points, config):
+def get_consistency_loss(end_points, ema_end_points, config, student=False):
     """
     Args:
         end_points: dict
@@ -131,8 +145,7 @@ def get_consistency_loss(end_points, ema_end_points, config):
     max_cls_student, argmax_cls_student = torch.max(pred_sem_cls_student, dim=2)
     iou_pred_student = nn.Sigmoid()(end_points['iou_scores'])
     if iou_pred_student.shape[2] > 1:
-        iou_pred_student = torch.gather(iou_pred_student, 2, argmax_cls_student.unsqueeze(-1)).squeeze(
-            -1)  # use pred semantic labels
+        iou_pred_student = torch.gather(iou_pred_student, 2, argmax_cls_student.unsqueeze(-1)).squeeze(-1)  # use pred semantic labels
     else:
         iou_pred_student = iou_pred_student.squeeze(-1)
 
@@ -148,20 +161,23 @@ def get_consistency_loss(end_points, ema_end_points, config):
     max_cls_ema, argmax_cls_ema = torch.max(pred_sem_cls_ema, dim=2)
     iou_pred_ema = nn.Sigmoid()(ema_end_points['iou_scores'])
     if iou_pred_ema.shape[2] > 1:
-        iou_pred_ema = torch.gather(iou_pred_ema, 2, argmax_cls_ema.unsqueeze(-1)).squeeze(
-            -1)  # use pred semantic labels
+        iou_pred_ema = torch.gather(iou_pred_ema, 2, argmax_cls_ema.unsqueeze(-1)).squeeze(-1)  # use pred semantic labels
     else:
         iou_pred_ema = iou_pred_ema.squeeze(-1)
 
     centre_ema_weight = objectness_ema * max_cls_ema * iou_pred_ema
-    class_ema_weight = objectness_ema * max_cls_ema * iou_pred_ema
-    size_ema_weight = objectness_ema * max_cls_ema * iou_pred_ema
+    class_ema_weight = objectness_ema * max_cls_ema
+    size_ema_weight = objectness_ema * iou_pred_ema
 
     center_consistency_loss, map_ind = compute_center_consistency_loss(end_points, ema_end_points,
-                                                                       centre_student_weight, centre_ema_weight)
-    class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight)
-    # class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind)
-    size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight)
+                                                                       centre_student_weight, centre_ema_weight, student)
+    if student:
+        class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_student_weight)
+        size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_student_weight)
+    else:
+        class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight)
+        # class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind)
+        size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight)
 
     consistency_loss = center_consistency_loss + class_consistency_loss + size_consistency_loss
 
