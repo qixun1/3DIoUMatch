@@ -12,7 +12,8 @@ import numpy as np
 import os
 import sys
 
-from utils.box_util import rot_gpu
+from models.ap_helper import parse_groundtruths
+from utils.box_util import rot_gpu, inside_bbox
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
@@ -109,10 +110,6 @@ class ProposalModule(nn.Module):
             batch_size, num_seed = end_points['seed_xyz'].shape[:2]
             sample_inds = torch.randint(0, num_seed, (batch_size, self.num_proposal), dtype=torch.int).cuda()
             xyz, features, _ = self.vote_aggregation(xyz, features, sample_inds)
-        elif self.sampling == 'ground_truth':
-            # TODO: add actual inds of votes (closest to center)
-            # create function to check if the votes are inside the bboxes
-            pass
         else:
             print('Unknown sampling strategy: %s. Exiting!' % (self.sampling))
             exit()
@@ -123,6 +120,7 @@ class ProposalModule(nn.Module):
         net = F.relu(self.bn2(self.conv2(net)))
         net = self.conv3(net)  # (batch_size, 2+3+num_heading_bin*2+num_size_cluster*4, num_proposal)
 
+        end_points['features'] = net
         end_points = decode_scores(net, end_points, self.num_class, self.num_heading_bin, self.num_size_cluster,
                                    self.mean_size_arr)
 

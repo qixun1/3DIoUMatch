@@ -218,7 +218,7 @@ class PointnetSAModuleVotes(nn.Module):
 
     def forward(self, xyz: torch.Tensor,
                 features: torch.Tensor = None,
-                inds: torch.Tensor = None) -> (torch.Tensor, torch.Tensor):
+                inds: torch.Tensor = None, grouped=False) -> (torch.Tensor, torch.Tensor):
         r"""
         Parameters
         ----------
@@ -239,23 +239,40 @@ class PointnetSAModuleVotes(nn.Module):
             (B, npoint) tensor of the inds
         """
 
-        xyz_flipped = xyz.transpose(1, 2).contiguous()
-        if inds is None:
-            inds = pointnet2_utils.furthest_point_sample(xyz, self.npoint)
-        else:
-            assert(inds.shape[1] == self.npoint)
-        new_xyz = pointnet2_utils.gather_operation(
-            xyz_flipped, inds
-        ).transpose(1, 2).contiguous() if self.npoint is not None else None
+        if not grouped:
+            xyz_flipped = xyz.transpose(1, 2).contiguous() # (B, 3, N)
+            if inds is None:
+                inds = pointnet2_utils.furthest_point_sample(xyz, self.npoint)
+            else:
+                assert(inds.shape[1] == self.npoint)
+            # inds: (B, npoint)
+            new_xyz = pointnet2_utils.gather_operation(
+                xyz_flipped, inds
+            ).transpose(1, 2).contiguous() if self.npoint is not None else None # (B, npoint, 3)
 
-        if not self.ret_unique_cnt:
-            grouped_features, grouped_xyz = self.grouper(
-                xyz, new_xyz, features
-            )  # (B, C, npoint, nsample)
+            if not self.ret_unique_cnt:
+                grouped_features, grouped_xyz = self.grouper(
+                    xyz, new_xyz, features
+                )  # (B, C, npoint, nsample), (B,3,npoint,nsample)
+            else:
+                grouped_features, grouped_xyz, unique_cnt = self.grouper(
+                    xyz, new_xyz, features
+                )  # (B, C, npoint, nsample), (B,3,npoint,nsample), (B,npoint)
         else:
-            grouped_features, grouped_xyz, unique_cnt = self.grouper(
-                xyz, new_xyz, features
-            )  # (B, C, npoint, nsample), (B,3,npoint,nsample), (B,npoint)
+            xyz_flipped = xyz.transpose(1, 2).contiguous()
+            new_xyz = pointnet2_utils.gather_operation(
+                xyz_flipped, inds
+            ).transpose(1, 2).contiguous() if self.npoint is not None else None
+            # (1, C, 1, npoint)
+            grouped_features = pointnet2_utils.gather_operation(features, inds).unsqueeze(2).contiguous()
+            grouped_xyz = new_xyz
+            new_xyz = new_xyz.transpose(1, 2).unsqueeze(2)
+            grouped_features = torch.cat(
+                [new_xyz, grouped_features], dim=1
+            )
+
+
+
 
         new_features = self.mlp_module(
             grouped_features

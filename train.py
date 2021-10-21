@@ -13,10 +13,15 @@ import torch
 import torch.optim as optim
 from torch import nn
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch_cluster import fps
 
 from models.loss_helper_consistency import get_consistency_loss
+# from models.loss_helper_sess_softweight_2 import get_consistency_loss
+from models.loss_helper_label_propagation import get_label_propagation_loss
 from models.votenet_iou_branch import VoteNet
 import utils.ramps as ramps
+from scannet.scannet_prototype_dataset import ScannetPrototypeDataset
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -56,12 +61,16 @@ parser.add_argument('--lr_decay_steps', default='400, 600, 800, 900',
                     help='When to decay the learning rate (in epochs)')
 parser.add_argument('--lr_decay_rates', default='0.3, 0.3, 0.1, 0.1',
                     help='Decay rates for lr decay')
-parser.add_argument('--ema_decay',  type=float,  default=0.999, metavar='ALPHA',
+parser.add_argument('--ema_decay', type=float, default=0.999, metavar='ALPHA',
                     help='ema variable decay rate')
 parser.add_argument('--unlabeled_loss_weight', type=float, default=2.0, metavar='WEIGHT',
                     help='use unlabeled loss with given weight')
-parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='WEIGHT', help='use consistency loss with given weight (default: None)')
-parser.add_argument('--consistency_rampup', type=int,  default=30,  metavar='EPOCHS', help='length of the consistency loss ramp-up')
+parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='WEIGHT',
+                    help='use consistency loss with given weight (default: None)')
+parser.add_argument('--consistency_rampup', type=int, default=30, metavar='EPOCHS',
+                    help='length of the consistency loss ramp-up')
+parser.add_argument('--proto_file', default='proto.pt', help='location to load/store prototypes')
+parser.add_argument('--use_clustering', action='store_true', help='use clustering to obtain prototypes')
 parser.add_argument('--use_student', action='store_true', help='consistency using student side weights')
 parser.add_argument('--use_iou_for_nms', action='store_true', help='whether use iou to guide test-time nms')
 parser.add_argument('--print_interval', type=int, default=25, help='batch interval to print loss')
@@ -88,20 +97,22 @@ BN_DECAY_STEP = FLAGS.bn_decay_step
 BN_DECAY_RATE = FLAGS.bn_decay_rate
 LR_DECAY_STEPS = [int(x) for x in FLAGS.lr_decay_steps.split(',')]
 LR_DECAY_RATES = [float(x) for x in FLAGS.lr_decay_rates.split(',')]
-assert(len(LR_DECAY_STEPS) == len(LR_DECAY_RATES))
+PROTO_FILE = FLAGS.proto_file
+CLUSTERING = FLAGS.use_clustering
+assert (len(LR_DECAY_STEPS) == len(LR_DECAY_RATES))
 
 LOG_DIR = FLAGS.log_dir
 if not os.path.exists(LOG_DIR):
     os.mkdir(LOG_DIR)
 
 LOG_FOUT = open(os.path.join(LOG_DIR, 'log_train.txt'), 'a')
-LOG_FOUT.write(str(FLAGS)+'\n')
+LOG_FOUT.write(str(FLAGS) + '\n')
 if not FLAGS.eval:
     PERFORMANCE_FOUT = open(os.path.join(LOG_DIR, 'best.txt'), 'w')
 
 
 def log_string(out_str):
-    LOG_FOUT.write(out_str+'\n')
+    LOG_FOUT.write(out_str + '\n')
     LOG_FOUT.flush()
     print(out_str)
 
@@ -116,13 +127,14 @@ if FLAGS.dataset == 'sunrgbd':
     from sunrgbd.sunrgbd_detection_dataset import SunrgbdDetectionVotesDataset
     from sunrgbd.sunrgbd_ssl_dataset import SunrgbdSSLLabeledDataset, SunrgbdSSLUnlabeledDataset
     from sunrgbd.model_util_sunrgbd import SunrgbdDatasetConfig
+
     DATASET_CONFIG = SunrgbdDatasetConfig()
     LABELED_DATASET = SunrgbdSSLLabeledDataset(labeled_sample_list=FLAGS.labeled_sample_list,
                                                num_points=NUM_POINT,
                                                augment=True,
                                                use_color=FLAGS.use_color,
                                                use_height=(not FLAGS.no_height),
-                                               use_v1 = (not FLAGS.use_sunrgbd_v2))
+                                               use_v1=(not FLAGS.use_sunrgbd_v2))
     UNLABELED_DATASET = SunrgbdSSLUnlabeledDataset(labeled_sample_list=FLAGS.labeled_sample_list,
                                                    num_points=NUM_POINT,
                                                    use_color=FLAGS.use_color,
@@ -138,51 +150,64 @@ elif FLAGS.dataset == 'scannet':
     from scannet.scannet_detection_dataset import ScannetDetectionDataset
     from scannet.scannet_ssl_dataset import ScannetSSLLabeledDataset, ScannetSSLUnlabeledDataset
     from scannet.model_util_scannet import ScannetDatasetConfig
+
     DATASET_CONFIG = ScannetDatasetConfig()
     LABELED_DATASET = ScannetSSLLabeledDataset(labeled_sample_list=FLAGS.labeled_sample_list,
-                                                        num_points=NUM_POINT,
-                                                        augment=True,
-                                                        use_color=FLAGS.use_color,
-                                                        use_height=(not FLAGS.no_height))
+                                               num_points=NUM_POINT,
+                                               augment=True,
+                                               use_color=FLAGS.use_color,
+                                               use_height=(not FLAGS.no_height))
     UNLABELED_DATASET = ScannetSSLUnlabeledDataset(labeled_sample_list=FLAGS.labeled_sample_list,
                                                    num_points=NUM_POINT,
                                                    use_color=FLAGS.use_color,
                                                    use_height=(not FLAGS.no_height),
                                                    load_labels=FLAGS.view_stats)
     TEST_DATASET = ScannetDetectionDataset('val',
-                                            num_points=NUM_POINT, augment=False,
-                                            use_color=FLAGS.use_color, use_height=(not FLAGS.no_height))
+                                           num_points=NUM_POINT, augment=False,
+                                           use_color=FLAGS.use_color, use_height=(not FLAGS.no_height))
+    PROTOTYPES_DATASET = ScannetPrototypeDataset(labeled_sample_list=FLAGS.labeled_sample_list,
+                                                 num_points=NUM_POINT,
+                                                 use_color=FLAGS.use_color,
+                                                 use_height=(not FLAGS.no_height))
 else:
-    print('Unknown dataset %s. Exiting...'%(FLAGS.dataset))
+    print('Unknown dataset %s. Exiting...' % (FLAGS.dataset))
     exit(-1)
 log_string('Dataset sizes: labeled-{0}; unlabeled-{1}; VALID-{2}'.format(len(LABELED_DATASET),
-                                                            len(UNLABELED_DATASET), len(TEST_DATASET)))
+                                                                         len(UNLABELED_DATASET), len(TEST_DATASET)))
 
-LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
-                              shuffle=True, num_workers=batch_size_list[0], worker_init_fn=my_worker_init_fn)
-UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
-                              shuffle=True, num_workers=batch_size_list[1]//2, worker_init_fn=my_worker_init_fn)
+# LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
+#                               shuffle=True, num_workers=batch_size_list[0], worker_init_fn=my_worker_init_fn)
+# UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
+#                               shuffle=True, num_workers=batch_size_list[1]//2, worker_init_fn=my_worker_init_fn)
 TEST_DATALOADER = DataLoader(TEST_DATASET, batch_size=8,
                              shuffle=False, num_workers=4, worker_init_fn=my_worker_init_fn)
+
+# issue with pycharm debugging if dataloader num_workers > 0
+LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
+                                shuffle=True, num_workers=0, worker_init_fn=my_worker_init_fn)
+UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
+                                  shuffle=True, num_workers=0, worker_init_fn=my_worker_init_fn)
+PROTOTYPES_DATALOADER = DataLoader(PROTOTYPES_DATASET, batch_size=1,
+                                  shuffle=False, num_workers=0, worker_init_fn=my_worker_init_fn)
 
 
 def create_model(ema=False):
     model = VoteNet(num_class=DATASET_CONFIG.num_class,
-                          num_heading_bin=DATASET_CONFIG.num_heading_bin,
-                          num_size_cluster=DATASET_CONFIG.num_size_cluster,
-                          mean_size_arr=DATASET_CONFIG.mean_size_arr,
-                          dataset_config=DATASET_CONFIG,
-                          num_proposal=FLAGS.num_target,
-                          input_feature_dim=num_input_channel,
-                          vote_factor=FLAGS.vote_factor,
-                          sampling=FLAGS.cluster_sampling)
+                    num_heading_bin=DATASET_CONFIG.num_heading_bin,
+                    num_size_cluster=DATASET_CONFIG.num_size_cluster,
+                    mean_size_arr=DATASET_CONFIG.mean_size_arr,
+                    dataset_config=DATASET_CONFIG,
+                    num_proposal=FLAGS.num_target,
+                    input_feature_dim=num_input_channel,
+                    vote_factor=FLAGS.vote_factor,
+                    sampling=FLAGS.cluster_sampling)
     if ema:
         for param in model.parameters():
             param.detach_()
     return model
 
 
-num_input_channel = int(FLAGS.use_color)*3 + int(not FLAGS.no_height)*1
+num_input_channel = int(FLAGS.use_color) * 3 + int(not FLAGS.no_height) * 1
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 detector = create_model()
@@ -231,7 +256,6 @@ if FLAGS.detector_checkpoint is not None and os.path.isfile(FLAGS.detector_check
     epoch_ckpt = checkpoint['epoch']
     print("Loaded votenet checkpoint %s (epoch: %d)" % (FLAGS.detector_checkpoint, epoch_ckpt))
 
-
 # Decay Batchnorm momentum from 0.5 to 0.999
 # note: pytorch's BN momentum (default 0.1)= 1 - tensorflow's BN momentum
 # inherited this from VoteNet and SESS
@@ -262,7 +286,6 @@ def adjust_learning_rate(optimizer, epoch):
 TRAIN_VISUALIZER = TfVisualizer(LOG_DIR, 'train')
 TEST_VISUALIZER = TfVisualizer(LOG_DIR, 'test')
 
-
 # Used for Pseudo box generation and AP calculation
 CONFIG_DICT = {'dataset_config': DATASET_CONFIG, 'unlabeled_batch_size': batch_size_list[1], 'dataset': FLAGS.dataset,
 
@@ -276,13 +299,15 @@ CONFIG_DICT = {'dataset_config': DATASET_CONFIG, 'unlabeled_batch_size': batch_s
 
                'use_unlabeled_obj_loss': False, 'use_unlabeled_vote_loss': False, 'vote_loss_size_factor': 1.0,
 
-               'samecls_match': False, 'view_stats': FLAGS.view_stats }
+               'samecls_match': False, 'view_stats': FLAGS.view_stats}
 
 for key in CONFIG_DICT.keys():
     if key != 'dataset_config':
         log_string(key + ': ' + str(CONFIG_DICT[key]))
 
 print('************************** GLOBAL CONFIG END **************************')
+
+
 # ------------------------------------------------------------------------- GLOBAL CONFIG END
 
 
@@ -305,16 +330,153 @@ def tb_name(key):
     else:
         return 'other/' + key
 
+
 # TODO: obtain prototype using pretrained model and do the clustering sample fixed number for each class or fixed ratio
 # after getting the prototypes using method in few shot 3d semantic segmentation do label propagation on the
 # unlabelled data
+def get_features(detector, end_points):
+    # replace get_feature in votenet
+    xyz, features = detector.backbone_net._break_up_pc(end_points['point_clouds'].to(device))
+
+    indices = []
+    for index in end_points['indices']:
+        indices.append(torch.tensor(index, dtype=torch.int).to(device))
+
+    # --------- 4 SET ABSTRACTION LAYERS ---------
+    xyz, features, fps_inds = detector.backbone_net.sa1(xyz, features, indices[0])
+    end_points['sa1_inds'] = fps_inds
+    end_points['sa1_xyz'] = xyz
+    end_points['sa1_features'] = features
+
+    xyz, features, fps_inds = detector.backbone_net.sa2(xyz, features, indices[1])
+    end_points['sa2_inds'] = fps_inds
+    end_points['sa2_xyz'] = xyz
+    end_points['sa2_features'] = features
+
+    xyz, features, fps_inds = detector.backbone_net.sa3(xyz, features)
+    end_points['sa3_xyz'] = xyz
+    end_points['sa3_features'] = features
+
+    xyz, features, fps_inds = detector.backbone_net.sa4(xyz, features)
+    end_points['sa4_xyz'] = xyz
+    end_points['sa4_features'] = features
+
+    # --------- 2 FEATURE UPSAMPLING LAYERS --------
+    features = detector.backbone_net.fp1(end_points['sa3_xyz'], end_points['sa4_xyz'], end_points['sa3_features'], end_points['sa4_features'])
+    features = detector.backbone_net.fp2(end_points['sa2_xyz'], end_points['sa3_xyz'], end_points['sa2_features'], features)
+    end_points['fp2_features'] = features
+    end_points['fp2_xyz'] = end_points['sa2_xyz']
+    num_seed = end_points['fp2_xyz'].shape[1]
+    end_points['fp2_inds'] = end_points['sa1_inds'][0:num_seed] # indices among the entire input point clouds
+
+    xyz = end_points['fp2_xyz']
+    features = end_points['fp2_features']
+    end_points['seed_xyz'] = xyz
+
+    xyz, features = detector.vgen(xyz, features)
+
+    features_norm = torch.norm(features, p=2, dim=1)
+    features = features.div(features_norm.unsqueeze(1))
+
+    sample_inds = torch.tensor(end_points['bbox_idx'], dtype=torch.int).unsqueeze(0).to(device)
+    # if indices.shape[1] < xyz.shape[1]:
+    #     sample_inds = torch.tensor(range(indices.shape[1]), dtype=torch.int).unsqueeze(0).to(device)
+    # else:
+    #     sample_inds = torch.tensor(range(xyz.shape[1]), dtype=torch.int).unsqueeze(0).to(device)
+
+    xyz, features, _ = detector.pnet.vote_aggregation(xyz, features, sample_inds, grouped=True)
+
+    # features = features.repeat(2,1,1) # to prevent batch norm error
+
+    net = F.relu(detector.pnet.bn1(detector.pnet.conv1(features)))
+    net = F.relu(detector.pnet.bn2(detector.pnet.conv2(net)))
+    return detector.pnet.conv3(net)
+
+def get_prototypes(detector, k=100, clustering=False, trainable=False):
+    detector.eval()
+    prototypes = []
+    labels = []
+    cls_feats = {}
+    # add logic to get dataloader with points from each class
+    for batch_idx, batch_data_label in enumerate(PROTOTYPES_DATALOADER):
+        indices = batch_data_label['overall_indices']
+        sem_class = batch_data_label['sem_cls_label'][0]
+        bbox_point_idx = batch_data_label['realigned_indices']
+        for i, bbox_idx in zip(sem_class, bbox_point_idx):
+            end_points = {}
+            end_points['point_clouds'] = batch_data_label['point_clouds']
+            end_points['indices'] = indices
+            end_points['bbox_idx'] = bbox_idx
+            feats = get_features(detector, end_points)
+            if feats is not None:
+                feats = feats.detach()
+                i = i.item()
+                if i not in cls_feats:
+                    cls_feats[i] = []
+                cls_feats[i].append(feats)
+
+    for cls, feats in cls_feats.items():
+        feats = torch.cat(feats, dim=-1)
+        feats = feats.squeeze(0).T
+        if clustering:
+            prototype = get_mutiple_prototypes(feats, k)
+        else:
+            prototype = feats
+
+        prototypes.append(prototype)
+        num_prototypes = prototype.shape[0]
+        class_labels = torch.zeros(num_prototypes, len(cls_feats))
+        class_labels[:, cls] = 1
+        labels.append(class_labels)
+    prototypes = torch.cat(prototypes, dim=0)
+    labels = torch.cat(labels, dim=0)
+    return prototypes, labels
+
+
+def get_mutiple_prototypes(feat, k):
+    """
+    Extract multiple prototypes by points separation and assembly
+    Args:
+        feat: input point features, shape:(n_points, feat_dim)
+    Return:
+        prototypes: output prototypes, shape: (n_prototypes, feat_dim)
+    """
+    # sample k seeds as initial centers with Farthest Point Sampling (FPS)
+    n = feat.shape[0]
+    feat_dim = feat.shape[1]
+    assert n > 0
+    ratio = k / n
+    if ratio < 1:
+        fps_index = fps(feat, None, ratio=ratio, random_start=False).unique()
+        num_prototypes = len(fps_index)
+        farthest_seeds = feat[fps_index]
+
+        # compute the point-to-seed distance
+        distances = F.pairwise_distance(feat[..., None], farthest_seeds.transpose(0, 1)[None, ...],
+                                        p=2)  # (n_points, n_prototypes)
+
+        # hard assignment for each point
+        assignments = torch.argmin(distances, dim=1)  # (n_points,)
+
+        # aggregating each cluster to form prototype
+        prototypes = torch.zeros((num_prototypes, feat_dim)).cuda()
+        for i in range(num_prototypes):
+            selected = torch.nonzero(assignments == i).squeeze(1)
+            selected = feat[selected, :]
+            prototypes[i] = selected.mean(0)
+        return prototypes
+    else:
+        return feat
+
 
 def get_current_consistency_weight(epoch):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
-    return FLAGS.consistency_weight
-    # return FLAGS.consistency_weight * ramps.sigmoid_rampup(epoch, FLAGS.consistency_rampup)
+    # return FLAGS.consistency_weight
+    return FLAGS.consistency_weight *\
+           ramps.sigmoid_rampup(epoch, FLAGS.consistency_rampup)
 
-def train_one_epoch(global_step):
+
+def train_one_epoch(global_step, prototypes=None, proto_labels=None):
     stat_dict = {}  # collect statistics
     adjust_learning_rate(optimizer, EPOCH_CNT)
     bnm_scheduler.step()  # decay BN momentum
@@ -333,9 +495,11 @@ def train_one_epoch(global_step):
 
         for key in batch_data_unlabeled:
             if type(batch_data_unlabeled[key]) == list:
-                batch_data_label[key] = torch.cat([batch_data_label[key]] + batch_data_unlabeled[key], dim=0)#.to(device)
+                batch_data_label[key] = torch.cat([batch_data_label[key]] + batch_data_unlabeled[key],
+                                                  dim=0)  # .to(device)
             else:
-                batch_data_label[key] = torch.cat((batch_data_label[key], batch_data_unlabeled[key]), dim=0)#.to(device)
+                batch_data_label[key] = torch.cat((batch_data_label[key], batch_data_unlabeled[key]),
+                                                  dim=0)  # .to(device)
 
         for key in batch_data_label:
             batch_data_label[key] = batch_data_label[key].to(device)
@@ -351,7 +515,7 @@ def train_one_epoch(global_step):
 
         # Compute loss and gradients, update parameters.
         for key in batch_data_label:
-            assert(key not in end_points)
+            assert (key not in end_points)
             end_points[key] = batch_data_label[key]
 
         detection_loss, end_points = train_labeled_criterion(end_points, DATASET_CONFIG, CONFIG_DICT)
@@ -359,12 +523,15 @@ def train_one_epoch(global_step):
         # unlabeled_loss, end_points = train_unlabeled_criterion(end_points, ema_end_points, DATASET_CONFIG, CONFIG_DICT)
 
         # TODO: add consistency loss here unlabelled data and let the weight be an argument
-        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
-        # TODO: add label propagation here using the global prototypes
+        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
+        # consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
 
+        # TODO: add label propagation here using the global prototypes
+        label_propagation_loss, end_points = get_label_propagation_loss(end_points, prototypes, proto_labels)
         # TODO: add pairwise loss on unlabelled data
 
-        loss = detection_loss + consistency_loss * consistency_weight
+        # loss = detection_loss + consistency_loss * consistency_weight
+        loss = detection_loss + consistency_loss * consistency_weight + label_propagation_loss
         # loss = detection_loss + unlabeled_loss * FLAGS.unlabeled_loss_weight
         end_points['loss'] = loss
         loss.backward()
@@ -440,8 +607,10 @@ def evaluate_one_epoch():
         metrics_dict = ap_calculator.compute_metrics()
         for key in metrics_dict:
             log_string('eval %s: %f' % (key, metrics_dict[key]))
-        TEST_VISUALIZER.log_scalars({'metrics_' + str(AP_IOU_THRESHOLDS[i]) + '/' + key: metrics_dict[key] for key in metrics_dict if key in ['mAP', 'AR']},
-                                    (EPOCH_CNT + 1) * len(LABELED_DATALOADER) * BATCH_SIZE)
+        TEST_VISUALIZER.log_scalars(
+            {'metrics_' + str(AP_IOU_THRESHOLDS[i]) + '/' + key: metrics_dict[key] for key in metrics_dict if
+             key in ['mAP', 'AR']},
+            (EPOCH_CNT + 1) * len(LABELED_DATALOADER) * BATCH_SIZE)
         map.append(metrics_dict['mAP'])
 
     mean_loss = stat_dict['detection_loss'] / float(batch_idx + 1)
@@ -489,7 +658,8 @@ def evaluate_with_opt():
             size_.requires_grad = True
             end_points_ = detector.forward_onlyiou_faster(end_points, center_, size_, heading_)
             iou = end_points_['iou_scores']
-            iou_gathered = torch.gather(iou, dim=2, index=sem_cls.unsqueeze(-1).detach()).squeeze(-1).contiguous().view(-1)
+            iou_gathered = torch.gather(iou, dim=2, index=sem_cls.unsqueeze(-1).detach()).squeeze(-1).contiguous().view(
+                -1)
             iou_gathered.backward(torch.ones(iou_gathered.shape).cuda())
             center_grad = center_.grad
             size_grad = size_.grad
@@ -509,7 +679,8 @@ def evaluate_with_opt():
         mean_size_arr = torch.from_numpy(mean_size_arr.astype(np.float32)).cuda()  # (num_size_cluster,3)
         size_base = torch.index_select(mean_size_arr, 0, size_class.view(-1))
         size_base = size_base.view(B, K, 3)
-        end_points['size_residuals'] = (size_ * 2 - size_base).unsqueeze(2).expand(-1, -1, DATASET_CONFIG.num_size_cluster, -1)
+        end_points['size_residuals'] = (size_ * 2 - size_base).unsqueeze(2).expand(-1, -1,
+                                                                                   DATASET_CONFIG.num_size_cluster, -1)
         optimizer.zero_grad()
 
         # if FLAGS.first_nms:
@@ -547,12 +718,15 @@ def evaluate_with_opt():
         metrics_dict = ap_calculator.compute_metrics()
         for key in metrics_dict:
             log_string('eval %s: %f' % (key, metrics_dict[key]))
-        TEST_VISUALIZER.log_scalars({'metrics_' + str(AP_IOU_THRESHOLDS[i]) + '/' + key: metrics_dict[key] for key in metrics_dict if key in ['mAP', 'AR']},
-                                    (EPOCH_CNT + 1) * len(LABELED_DATALOADER) * BATCH_SIZE)
+        TEST_VISUALIZER.log_scalars(
+            {'metrics_' + str(AP_IOU_THRESHOLDS[i]) + '/' + key: metrics_dict[key] for key in metrics_dict if
+             key in ['mAP', 'AR']},
+            (EPOCH_CNT + 1) * len(LABELED_DATALOADER) * BATCH_SIZE)
         map.append(metrics_dict['mAP'])
 
     mean_loss = stat_dict['detection_loss'] / float(batch_idx + 1)
     return mean_loss, map
+
 
 def train():
     global EPOCH_CNT
@@ -574,7 +748,8 @@ def train():
     for epoch in range(start_from, MAX_EPOCH):
         EPOCH_CNT = epoch
         log_string('\n**** EPOCH %03d, STEP %d ****' % (epoch, global_step))
-        log_string("Current epoch: %d, obj threshold = %.3f & cls threshold = %.3f" % (epoch, CONFIG_DICT['obj_threshold'], CONFIG_DICT['cls_threshold']))
+        log_string("Current epoch: %d, obj threshold = %.3f & cls threshold = %.3f" % (
+        epoch, CONFIG_DICT['obj_threshold'], CONFIG_DICT['cls_threshold']))
         log_string('Current learning rate: %f' % (get_current_lr(epoch)))
         log_string('Current BN decay momentum: %f' % (bnm_scheduler.lmbd(bnm_scheduler.last_epoch)))
         log_string(str(datetime.now()))
@@ -582,7 +757,15 @@ def train():
         # in numpy 1.18.5 this actually sets `np.random.get_state()[1][0]` to default value
         # so the test data is consistent as the initial seed is the same
         np.random.seed()
-        global_step = train_one_epoch(global_step)
+        if not os.path.isfile(PROTO_FILE):
+            prototypes, proto_labels = get_prototypes(detector)
+            torch.save({'prototypes': prototypes, 'proto_labels': proto_labels}, PROTO_FILE)
+        else:
+            obj = torch.load(PROTO_FILE)
+            prototypes = obj['prototypes']
+            proto_labels = obj['proto_labels']
+        global_step = train_one_epoch(global_step, prototypes, proto_labels)
+        # global_step = train_one_epoch(global_step)
         map = 0.0
         if EPOCH_CNT > 0 and EPOCH_CNT % FLAGS.eval_interval == 0:
             loss, map = evaluate_one_epoch()

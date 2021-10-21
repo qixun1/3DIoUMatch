@@ -6,3 +6,4 @@ CKPT=$5
 mkdir -p "${LOG_DIR}";
 python -u train.py --log_dir="${LOG_DIR}" --dataset="${DATASET}" --detector_checkpoint="${CKPT}" \
 --labeled_sample_list="${LABELED_LIST}" --use_iou_for_nms --eval
+#--labeled_sample_list="${LABELED_LIST}" --eval
