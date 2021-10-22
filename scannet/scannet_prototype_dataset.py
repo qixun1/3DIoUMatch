@@ -16,6 +16,9 @@ import sys
 import random
 import numpy as np
 from torch.utils.data import Dataset
+
+from visualize_votes_and_bboxes import visualise_indices
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.append(ROOT_DIR)
@@ -177,22 +180,16 @@ class ScannetPrototypeDataset(Dataset):
         bbox_point_idx = []
         num_points = []
 
-        mapping = {} # mapping from original 50000 to 40000
-        counter = 0
-
         for id, gt in enumerate(instance_bboxes):
             center = gt[:3]
             size = gt[3:6]
             corner_boxes = my_compute_box_3d(center, size, 0) # hardcode heading to 0
             pc, pc_in_bbox = extract_pc_in_box3d(point_cloud, corner_boxes)
             idx = np.nonzero(pc_in_bbox)[0]
-            for i in idx:
-                if i not in mapping:
-                    mapping[i] = counter
-                    counter += 1
 
             bbox_point_idx.append(idx)
             num_points.append(len(idx))
+            # visualise_indices(instance_bboxes, point_cloud, idx)
         indices = np.concatenate(bbox_point_idx)
         indices = np.unique(indices)
 
@@ -213,11 +210,11 @@ class ScannetPrototypeDataset(Dataset):
             point_cloud, choices = pc_util.random_sampling(point_cloud[indices], self.num_points,
                                                    return_choices=True)
             choices = np.array([indices[c] for c in choices])
-            for i, c in enumerate(choices):
-                mapping[c] = i
+            indices = choices
         min_size = min(max(20, min(num_points)), 2048 // len(bbox_point_idx))
 
         overall_indices = []
+        original_indices = []
         realigned_indices = []
         pc = point_cloud
         for npoints in [2048, 1024]:
@@ -226,15 +223,19 @@ class ScannetPrototypeDataset(Dataset):
             index_list = []
             for j, bbox in enumerate(bbox_point_idx):
                 if len(realigned_indices) == 0:
-                    index = np.array([mapping[idx] for idx in bbox if idx in choices])
+                    index = np.array([np.where(indices==idx)[0][0] for idx in bbox if idx in choices])
                 else:
                     index = realigned_indices[j]
                 pc2, new_choices = pc_util.random_sampling(pc[index], min_size,
                                                           return_choices=True)
                 pcs.append(pc2)
                 new_choices = np.array([index[c] for c in new_choices])
+                # visualise_indices(instance_bboxes, pc, new_choices)
                 bbox_indices.append(new_choices)
+
                 index_list.append(list(range(j*len(new_choices), (j+1)*len(new_choices))))
+
+            original_indices.append(bbox_indices)
 
             if npoints > min_size*(len(bbox_point_idx)):
                 len_p = len(pc)
@@ -255,6 +256,7 @@ class ScannetPrototypeDataset(Dataset):
             realigned_indices = index_list
             overall_indices.append(bbox_indices)
             min_size //= 2
+
 
 
         # for j, bbox in enumerate(bbox_point_idx):
@@ -308,6 +310,8 @@ class ScannetPrototypeDataset(Dataset):
         ret_dict['sem_cls_label'] = target_bboxes_semcls.astype(np.int64)
         ret_dict['realigned_indices'] = realigned_indices
         ret_dict['overall_indices'] = overall_indices
+        ret_dict['original_indices'] = original_indices
+        ret_dict['bboxes'] = instance_bboxes
 
         return ret_dict
 

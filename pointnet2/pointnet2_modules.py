@@ -265,10 +265,9 @@ class PointnetSAModuleVotes(nn.Module):
             ).transpose(1, 2).contiguous() if self.npoint is not None else None
             # (1, C, 1, npoint)
             grouped_features = pointnet2_utils.gather_operation(features, inds).unsqueeze(2).contiguous()
-            grouped_xyz = new_xyz
-            new_xyz = new_xyz.transpose(1, 2).unsqueeze(2)
+            grouped_xyz = new_xyz.transpose(1, 2).unsqueeze(2)
             grouped_features = torch.cat(
-                [new_xyz, grouped_features], dim=1
+                [grouped_xyz, grouped_features], dim=1
             )
 
 

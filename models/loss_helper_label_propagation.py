@@ -27,7 +27,7 @@ def label_propagate(A, Y, alpha=0.99):
     Z = torch.inverse(torch.eye(num_nodes).cuda() - alpha*S + eps) @ Y
     return Z
 
-def calculateLocalConstrainedAffinity(node_feat, k=200, method='gaussian'):
+def calculateLocalConstrainedAffinity(node_feat, k=200, method='gaussian', sigma=1.0):
     """
     Calculate the Affinity matrix of the nearest neighbor graph constructed by prototypes and query points,
     It is a efficient way when the number of nodes in the graph is too large.
@@ -57,7 +57,6 @@ def calculateLocalConstrainedAffinity(node_feat, k=200, method='gaussian'):
         knn_similarity = F.cosine_similarity(node_feat[:,None,:], knn_feat, dim=2)
     elif method == 'gaussian':
         dist = F.pairwise_distance(node_feat[:,:,None], knn_feat.transpose(1,2), p=2)
-        sigma = 1.
         knn_similarity = torch.exp(-0.5*(dist/sigma)**2)
     else:
         raise NotImplementedError('Error! Distance computation method (%s) is unknown!' %method)
@@ -70,7 +69,7 @@ def calculateLocalConstrainedAffinity(node_feat, k=200, method='gaussian'):
     A = A * (1 - identity_matrix)
     return A
 
-def get_label_propagation_loss(end_points, prototypes, proto_labels):
+def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0):
     """
     Args:
         end_points: dict
@@ -95,7 +94,7 @@ def get_label_propagation_loss(end_points, prototypes, proto_labels):
     Y[:num_prototypes] = proto_labels
     # do label propagation
     node_feat = torch.cat((prototypes, query_feat), dim=0) #(num_nodes, feat_dim)
-    A = calculateLocalConstrainedAffinity(node_feat, k=5)
+    A = calculateLocalConstrainedAffinity(node_feat, k=100, sigma=sigma)
     propagated_labels = label_propagate(A, Y)
 
     pseudo_labels = propagated_labels[num_prototypes:, :]

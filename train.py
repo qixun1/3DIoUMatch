@@ -22,6 +22,7 @@ from models.loss_helper_label_propagation import get_label_propagation_loss
 from models.votenet_iou_branch import VoteNet
 import utils.ramps as ramps
 from scannet.scannet_prototype_dataset import ScannetPrototypeDataset
+from visualize_votes_and_bboxes import visualize_votes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -69,6 +70,7 @@ parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='W
                     help='use consistency loss with given weight (default: None)')
 parser.add_argument('--consistency_rampup', type=int, default=30, metavar='EPOCHS',
                     help='length of the consistency loss ramp-up')
+parser.add_argument('--sigma', type=float, default=1.0, help='sigma for label propagation')
 parser.add_argument('--proto_file', default='proto.pt', help='location to load/store prototypes')
 parser.add_argument('--use_clustering', action='store_true', help='use clustering to obtain prototypes')
 parser.add_argument('--use_student', action='store_true', help='consistency using student side weights')
@@ -92,6 +94,7 @@ BATCH_SIZE = batch_size_list[0] + batch_size_list[1]
 STUDENT = FLAGS.use_student
 NUM_POINT = FLAGS.num_point
 MAX_EPOCH = FLAGS.max_epoch
+sigma = FLAGS.sigma
 BASE_LEARNING_RATE = FLAGS.learning_rate
 BN_DECAY_STEP = FLAGS.bn_decay_step
 BN_DECAY_RATE = FLAGS.bn_decay_rate
@@ -374,6 +377,7 @@ def get_features(detector, end_points):
     end_points['seed_xyz'] = xyz
 
     xyz, features = detector.vgen(xyz, features)
+    end_points['vote_xyz'] = xyz
 
     features_norm = torch.norm(features, p=2, dim=1)
     features = features.div(features_norm.unsqueeze(1))
@@ -385,12 +389,12 @@ def get_features(detector, end_points):
     #     sample_inds = torch.tensor(range(xyz.shape[1]), dtype=torch.int).unsqueeze(0).to(device)
 
     xyz, features, _ = detector.pnet.vote_aggregation(xyz, features, sample_inds, grouped=True)
-
+    end_points['aggregated_vote_xyz'] = xyz
     # features = features.repeat(2,1,1) # to prevent batch norm error
 
     net = F.relu(detector.pnet.bn1(detector.pnet.conv1(features)))
     net = F.relu(detector.pnet.bn2(detector.pnet.conv2(net)))
-    return detector.pnet.conv3(net)
+    return net, end_points
 
 def get_prototypes(detector, k=100, clustering=False, trainable=False):
     detector.eval()
@@ -402,12 +406,17 @@ def get_prototypes(detector, k=100, clustering=False, trainable=False):
         indices = batch_data_label['overall_indices']
         sem_class = batch_data_label['sem_cls_label'][0]
         bbox_point_idx = batch_data_label['realigned_indices']
-        for i, bbox_idx in zip(sem_class, bbox_point_idx):
+        bboxes = batch_data_label['bboxes']
+        original_indices = batch_data_label['original_indices']
+        for j, (i, bbox_idx) in enumerate(zip(sem_class, bbox_point_idx)):
             end_points = {}
             end_points['point_clouds'] = batch_data_label['point_clouds']
             end_points['indices'] = indices
             end_points['bbox_idx'] = bbox_idx
-            feats = get_features(detector, end_points)
+            end_points['bboxes'] = bboxes
+            end_points['original_indices'] = [original_indices[0][j], original_indices[1][j]]
+            feats, end_points = get_features(detector, end_points)
+            # visualize_votes(end_points)
             if feats is not None:
                 feats = feats.detach()
                 i = i.item()
@@ -527,7 +536,7 @@ def train_one_epoch(global_step, prototypes=None, proto_labels=None):
         # consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
 
         # TODO: add label propagation here using the global prototypes
-        label_propagation_loss, end_points = get_label_propagation_loss(end_points, prototypes, proto_labels)
+        label_propagation_loss, end_points = get_label_propagation_loss(end_points, prototypes, proto_labels, sigma)
         # TODO: add pairwise loss on unlabelled data
 
         # loss = detection_loss + consistency_loss * consistency_weight
