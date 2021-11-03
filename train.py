@@ -19,10 +19,12 @@ from torch_cluster import fps
 from models.loss_helper_consistency import get_consistency_loss
 # from models.loss_helper_sess_softweight_2 import get_consistency_loss
 from models.loss_helper_label_propagation import get_label_propagation_loss
+from models.proposal_module import decode_scores
 from models.votenet_iou_branch import VoteNet
 import utils.ramps as ramps
 from scannet.scannet_prototype_dataset import ScannetPrototypeDataset
-from visualize_votes_and_bboxes import visualize_votes
+from utils.vis_utils import visualise_features
+from utils.visualize_votes_and_bboxes import visualize_votes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -70,16 +72,24 @@ parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='W
                     help='use consistency loss with given weight (default: None)')
 parser.add_argument('--consistency_rampup', type=int, default=30, metavar='EPOCHS',
                     help='length of the consistency loss ramp-up')
+parser.add_argument('--label_propagation_weight', type=float, default=1.0, metavar='WEIGHT',
+                    help='use label propagation loss with given weight (default: None)')
+parser.add_argument('--label_propagation_rampup', type=int, default=30, metavar='EPOCHS',
+                    help='length of the label propagation loss ramp-up')
 parser.add_argument('--sigma', type=float, default=1.0, help='sigma for label propagation')
 parser.add_argument('--proto_file', default='proto.pt', help='location to load/store prototypes')
 parser.add_argument('--use_clustering', action='store_true', help='use clustering to obtain prototypes')
+parser.add_argument('--k', type=int, default=10, help='number of prototype clusters for each class')
 parser.add_argument('--use_student', action='store_true', help='consistency using student side weights')
 parser.add_argument('--use_iou_for_nms', action='store_true', help='whether use iou to guide test-time nms')
+parser.add_argument('--proto_interval', type=int, default=10, help='batch interval to recalculate prototypes')
+parser.add_argument('--proto_trainable', action='store_true', help='regenerate prototypes at intervals')
 parser.add_argument('--print_interval', type=int, default=25, help='batch interval to print loss')
 parser.add_argument('--eval_interval', type=int, default=25, help='epoch interval to evaluate model')
 parser.add_argument('--save_interval', type=int, default=200, help='epoch interval to save model')
 parser.add_argument('--resume', action='store_true', help='resume training instead of just loading a pre-train model')
 parser.add_argument('--eval', action='store_true')
+parser.add_argument('--debug', action='store_true', help='debug model')
 parser.add_argument('--conf_thresh', type=float, default=0.05)
 parser.add_argument('--view_stats', action='store_true')
 parser.add_argument('--opt_rate', type=float, default=5e-4, help='Optimization rate for eval with opt')
@@ -102,6 +112,8 @@ LR_DECAY_STEPS = [int(x) for x in FLAGS.lr_decay_steps.split(',')]
 LR_DECAY_RATES = [float(x) for x in FLAGS.lr_decay_rates.split(',')]
 PROTO_FILE = FLAGS.proto_file
 CLUSTERING = FLAGS.use_clustering
+k = FLAGS.k
+DEBUG = FLAGS.debug
 assert (len(LR_DECAY_STEPS) == len(LR_DECAY_RATES))
 
 LOG_DIR = FLAGS.log_dir
@@ -178,20 +190,21 @@ else:
 log_string('Dataset sizes: labeled-{0}; unlabeled-{1}; VALID-{2}'.format(len(LABELED_DATASET),
                                                                          len(UNLABELED_DATASET), len(TEST_DATASET)))
 
-# LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
-#                               shuffle=True, num_workers=batch_size_list[0], worker_init_fn=my_worker_init_fn)
-# UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
-#                               shuffle=True, num_workers=batch_size_list[1]//2, worker_init_fn=my_worker_init_fn)
-TEST_DATALOADER = DataLoader(TEST_DATASET, batch_size=8,
-                             shuffle=False, num_workers=4, worker_init_fn=my_worker_init_fn)
-
-# issue with pycharm debugging if dataloader num_workers > 0
-LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
-                                shuffle=True, num_workers=0, worker_init_fn=my_worker_init_fn)
-UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
-                                  shuffle=True, num_workers=0, worker_init_fn=my_worker_init_fn)
-PROTOTYPES_DATALOADER = DataLoader(PROTOTYPES_DATASET, batch_size=1,
-                                  shuffle=False, num_workers=0, worker_init_fn=my_worker_init_fn)
+if not DEBUG:
+    LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
+                                  shuffle=True, num_workers=batch_size_list[0], worker_init_fn=my_worker_init_fn)
+    UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
+                                  shuffle=True, num_workers=batch_size_list[1]//2, worker_init_fn=my_worker_init_fn)
+    TEST_DATALOADER = DataLoader(TEST_DATASET, batch_size=8,
+                                 shuffle=False, num_workers=4, worker_init_fn=my_worker_init_fn)
+else:
+    # issue with pycharm debugging if dataloader num_workers > 0
+    LABELED_DATALOADER = DataLoader(LABELED_DATASET, batch_size=batch_size_list[0],
+                                    shuffle=True, num_workers=0, worker_init_fn=my_worker_init_fn)
+    UNLABELED_DATALOADER = DataLoader(UNLABELED_DATASET, batch_size=batch_size_list[1],
+                                      shuffle=True, num_workers=0, worker_init_fn=my_worker_init_fn)
+    PROTOTYPES_DATALOADER = DataLoader(PROTOTYPES_DATASET, batch_size=1,
+                                      shuffle=False, num_workers=0, worker_init_fn=my_worker_init_fn)
 
 
 def create_model(ema=False):
@@ -394,13 +407,24 @@ def get_features(detector, end_points):
 
     net = F.relu(detector.pnet.bn1(detector.pnet.conv1(features)))
     net = F.relu(detector.pnet.bn2(detector.pnet.conv2(net)))
+    net = detector.pnet.conv3(net)  # (batch_size, 2+3+num_heading_bin*2+num_size_cluster*4, num_proposal)
+
+
+    end_points = decode_scores(net, end_points, detector.pnet.num_class, detector.pnet.num_heading_bin,
+                               detector.pnet.num_size_cluster, detector.pnet.mean_size_arr)
+
+    center, size, heading = detector.calculate_bbox(end_points)
+
     return net, end_points
 
-def get_prototypes(detector, k=100, clustering=False, trainable=False):
+def get_prototypes(detector, k=100, clustering=False):
     detector.eval()
     prototypes = []
     labels = []
     cls_feats = {}
+    correctness = 0
+    objectness = 0
+    bbox_num = 0
     # add logic to get dataloader with points from each class
     for batch_idx, batch_data_label in enumerate(PROTOTYPES_DATALOADER):
         indices = batch_data_label['overall_indices']
@@ -415,7 +439,17 @@ def get_prototypes(detector, k=100, clustering=False, trainable=False):
             end_points['bbox_idx'] = bbox_idx
             end_points['bboxes'] = bboxes
             end_points['original_indices'] = [original_indices[0][j], original_indices[1][j]]
+            end_points['cls'] = i
             feats, end_points = get_features(detector, end_points)
+            obj_score = nn.Softmax(dim=2)(end_points['objectness_scores'])[:, :, 1]
+            sem_cls_score = nn.Softmax(dim=2)(end_points['sem_cls_scores'])
+            pred_cls_prob, pred_cls = torch.max(sem_cls_score, -1)
+            act_cls_prob = sem_cls_score[:, :, i]
+            if i.item() == pred_cls.item() and pred_cls_prob.item() > 0.5:
+                correctness += 1
+            if obj_score.item() > 0.9:
+                objectness += 1
+
             # visualize_votes(end_points)
             if feats is not None:
                 feats = feats.detach()
@@ -423,6 +457,9 @@ def get_prototypes(detector, k=100, clustering=False, trainable=False):
                 if i not in cls_feats:
                     cls_feats[i] = []
                 cls_feats[i].append(feats)
+        bbox_num += j+1
+    correctness /= bbox_num
+    objectness /= bbox_num
 
     for cls, feats in cls_feats.items():
         feats = torch.cat(feats, dim=-1)
@@ -439,6 +476,8 @@ def get_prototypes(detector, k=100, clustering=False, trainable=False):
         labels.append(class_labels)
     prototypes = torch.cat(prototypes, dim=0)
     labels = torch.cat(labels, dim=0)
+    visualise_features(prototypes.detach().cpu().numpy(), torch.argmax(labels, dim=-1).detach().cpu().numpy(),
+                       'assets/original_prototypes')
     return prototypes, labels
 
 
@@ -477,6 +516,12 @@ def get_mutiple_prototypes(feat, k):
     else:
         return feat
 
+def get_current_label_propagation_weight(epoch):
+    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    return FLAGS.label_propagation_weight
+    # return FLAGS.label_propagation_weight * \
+    #        ramps.sigmoid_rampup(epoch, FLAGS.label_propagation_rampup)
+
 
 def get_current_consistency_weight(epoch):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
@@ -492,6 +537,7 @@ def train_one_epoch(global_step, prototypes=None, proto_labels=None):
     detector.train()  # set model to training mode
     ema_detector.train()
     consistency_weight = get_current_consistency_weight(EPOCH_CNT)
+    label_propagation_weight = get_current_label_propagation_weight(EPOCH_CNT)
 
     unlabeled_dataloader_iterator = iter(UNLABELED_DATALOADER)
 
@@ -532,15 +578,15 @@ def train_one_epoch(global_step, prototypes=None, proto_labels=None):
         # unlabeled_loss, end_points = train_unlabeled_criterion(end_points, ema_end_points, DATASET_CONFIG, CONFIG_DICT)
 
         # TODO: add consistency loss here unlabelled data and let the weight be an argument
-        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
-        # consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
+        # consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
+        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
 
         # TODO: add label propagation here using the global prototypes
         label_propagation_loss, end_points = get_label_propagation_loss(end_points, prototypes, proto_labels, sigma)
         # TODO: add pairwise loss on unlabelled data
 
         # loss = detection_loss + consistency_loss * consistency_weight
-        loss = detection_loss + consistency_loss * consistency_weight + label_propagation_loss
+        loss = detection_loss + consistency_loss * consistency_weight + label_propagation_loss * label_propagation_weight
         # loss = detection_loss + unlabeled_loss * FLAGS.unlabeled_loss_weight
         end_points['loss'] = loss
         loss.backward()
@@ -754,6 +800,15 @@ def train():
     start_from = 0
     if FLAGS.resume:
         start_from = start_epoch
+
+    if not os.path.isfile(PROTO_FILE):
+        prototypes, proto_labels = get_prototypes(detector, k=k, clustering=CLUSTERING)
+        torch.save({'prototypes': prototypes, 'proto_labels': proto_labels}, PROTO_FILE)
+    else:
+        obj = torch.load(PROTO_FILE)
+        prototypes = obj['prototypes']
+        proto_labels = obj['proto_labels']
+
     for epoch in range(start_from, MAX_EPOCH):
         EPOCH_CNT = epoch
         log_string('\n**** EPOCH %03d, STEP %d ****' % (epoch, global_step))
@@ -766,13 +821,10 @@ def train():
         # in numpy 1.18.5 this actually sets `np.random.get_state()[1][0]` to default value
         # so the test data is consistent as the initial seed is the same
         np.random.seed()
-        if not os.path.isfile(PROTO_FILE):
-            prototypes, proto_labels = get_prototypes(detector)
-            torch.save({'prototypes': prototypes, 'proto_labels': proto_labels}, PROTO_FILE)
-        else:
-            obj = torch.load(PROTO_FILE)
-            prototypes = obj['prototypes']
-            proto_labels = obj['proto_labels']
+
+        if FLAGS.proto_trainable and epoch % FLAGS.proto_interval == 0:
+            prototypes, proto_labels = get_prototypes(detector, k=k, clustering=CLUSTERING)
+
         global_step = train_one_epoch(global_step, prototypes, proto_labels)
         # global_step = train_one_epoch(global_step)
         map = 0.0

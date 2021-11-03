@@ -177,8 +177,8 @@ def get_consistency_loss(end_points, ema_end_points, config, student=False):
                                                                        centre_student_weight, centre_ema_weight, student)
     if student:
         # still use ema weights
-        class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight)
-        size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight)
+        class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight, student)
+        size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight, student)
     else:
         class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight)
         # class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind)

@@ -3,6 +3,9 @@ import torch.nn.functional as F
 import faiss
 
 import numpy as np
+from torch import nn
+
+from utils.vis_utils import visualise_features
 
 
 def label_propagate(A, Y, alpha=0.99):
@@ -69,7 +72,7 @@ def calculateLocalConstrainedAffinity(node_feat, k=200, method='gaussian', sigma
     A = A * (1 - identity_matrix)
     return A
 
-def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0):
+def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0, weighing='soft'):
     """
     Args:
         end_points: dict
@@ -99,14 +102,36 @@ def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0):
 
     pseudo_labels = propagated_labels[num_prototypes:, :]
     pseudo_labels = torch.argmax(pseudo_labels, dim=-1)
+    proto_labels = torch.argmax(proto_labels, dim=-1)
+
+    # visualise_features(prototypes.detach().cpu().numpy(), proto_labels.detach().cpu().numpy(),
+    #                    "assets/labelled_feats")
+    # visualise_features(query_feat.detach().cpu().numpy(), pseudo_labels.detach().cpu().numpy(),
+    #                    "assets/unlabelled_feats")
 
     # cross entropy of propagated feature vs predicted feature?
 
     pred_labels = end_points['sem_cls_scores'][unsupervised_inds, ...]
 
     pred_labels = pred_labels.reshape(-1, pred_labels.shape[-1])
+    pred_objectness = end_points['objectness_scores'][unsupervised_inds, ...]
+    pred_objectness = nn.Softmax(dim=2)(pred_objectness)
 
-    label_propagation_loss = F.cross_entropy(pred_labels, pseudo_labels)
+    if weighing == 'soft':
+        weight = pred_objectness[:, :, 1].reshape(-1)
+    elif weighing == 'hard':
+        objectness_mask = pred_objectness[:, :, 1].reshape(-1) > 0.9
+        pred_labels = torch.gather(pred_labels, index=objectness_mask)
+        pseudo_labels = torch.gather(pseudo_labels, index=objectness_mask)
+        weight = torch.ones(objectness_mask.shape)
+    else:
+        pass
+
+    if weight is not None:
+        label_propagation_loss = F.cross_entropy(pred_labels, pseudo_labels, reduction='none')
+        label_propagation_loss = torch.mean(weight * label_propagation_loss)
+    else:
+        label_propagation_loss = F.cross_entropy(pred_labels, pseudo_labels)
     end_points['label_propagation_loss'] = label_propagation_loss
 
     return label_propagation_loss, end_points

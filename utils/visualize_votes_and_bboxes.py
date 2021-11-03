@@ -2,6 +2,8 @@ import os
 
 import numpy as np
 import torch
+import vtk
+from torch import nn
 
 import vis_utils as vis
 from utils.box_util import get_3d_box_depth
@@ -48,7 +50,34 @@ def visualize_votes(example):
         vtk_box3D = vis.vtk_box_3D(box3d, line_width=2, color=vis.Color.Green)
         vtk_gt_boxes.append(vtk_box3D)
 
-    key_to_actors_to_hide = {'g': vtk_aggregated_votes, 'p': vtk_sa1, 'k': vtk_sa2, 'b': vtk_gt_boxes}
+    if 'center' in example:
+        vtk_pred_boxes = []
+        center = example['center'].detach().cpu().numpy()
+        center = np.mean(center, axis=1).reshape(-1)
+        pred_bbox = get_3d_box_depth((example['size']*2).detach().cpu().numpy().reshape(-1), 0, center)
+        vtk_predbox3D = vis.vtk_box_3D(pred_bbox, line_width=2, color=vis.Color.Red)
+        vtk_pred_boxes.append(vtk_predbox3D)
+
+        label = vtk.vtkVectorText()
+        obj_score = nn.Softmax(dim=2)(example['objectness_scores'])[:, :, 1]
+        sem_cls_score = nn.Softmax(dim=2)(example['sem_cls_scores'])
+        pred_cls_prob, pred_cls = torch.max(sem_cls_score, -1)
+        cls = example['cls']
+        act_cls_prob = sem_cls_score[:, :, cls]
+        label.SetText(f'objectness score: {obj_score.detach().cpu().numpy().reshape(-1)}\n'
+                      f'pred sem class: {pred_cls.detach().cpu().numpy().reshape(-1)} ({pred_cls_prob.detach().cpu().numpy().reshape(-1)})\n'
+                      f'actual sem class: {cls.detach().cpu().numpy()} ({act_cls_prob.detach().cpu().numpy().reshape(-1)})')
+        lblMapper = vtk.vtkPolyDataMapper()
+        lblMapper.SetInputConnection(label.GetOutputPort())
+        vtk_obj = vtk.vtkFollower()
+        vtk_obj.SetMapper(lblMapper)
+        vtk_obj.SetScale(0.15,0.15,0.15)
+        vtk_obj.SetPosition(0,0,0)
+
+        vtk_actors.append(vtk_obj)
+
+
+    key_to_actors_to_hide = {'g': vtk_aggregated_votes, 'p': vtk_sa1, 'k': vtk_sa2, 'b': vtk_gt_boxes, 'r': vtk_pred_boxes}
     vis.start_render(vtk_actors, key_to_actors_to_hide=key_to_actors_to_hide, background_col=vis.Color.White)
 
 

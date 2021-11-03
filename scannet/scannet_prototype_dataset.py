@@ -17,14 +17,11 @@ import random
 import numpy as np
 from torch.utils.data import Dataset
 
-from visualize_votes_and_bboxes import visualise_indices
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.append(ROOT_DIR)
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 import pc_util
-from model_util_scannet import rotate_aligned_boxes
 
 from model_util_scannet import ScannetDatasetConfig
 DC = ScannetDatasetConfig()
