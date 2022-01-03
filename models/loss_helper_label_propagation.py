@@ -1,8 +1,10 @@
 import torch
+from torch import nn
 import torch.nn.functional as F
 import faiss
 
 import numpy as np
+from utils.box_util import box3d_iou_batch_gpu
 
 
 def label_propagate(A, Y, alpha=0.99):
@@ -69,7 +71,8 @@ def calculateLocalConstrainedAffinity(node_feat, k=200, method='gaussian', sigma
     A = A * (1 - identity_matrix)
     return A
 
-def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0):
+def get_label_propagation_loss(end_points, prototypes, proto_labels, config_dict, sigma=1.0,
+                               obj_threshold=0.8, iou_threshold=0.1):
     """
     Args:
         end_points: dict
@@ -87,7 +90,18 @@ def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0):
     unsupervised_inds = torch.nonzero(1 - supervised_mask).squeeze(1).long()
     num_prototypes = prototypes.shape[0]
     query_feat = end_points['features'][unsupervised_inds, ...]
-    query_feat = query_feat.view(-1, query_feat.shape[1])
+    batch_size = query_feat.shape[0]
+    feat_dim = query_feat.shape[1]
+    query_feat = query_feat.view(-1, feat_dim)
+    # filter out proposals that do not meet the threshold for the objectness score
+    pred_objectness = end_points['objectness_scores'][unsupervised_inds, ...]
+    pred_objectness = nn.Softmax(dim=2)(pred_objectness)
+    objectness_mask = pred_objectness[:, :, 1].reshape(-1) > obj_threshold
+
+
+    objectness_mask = objectness_mask.view(-1)
+    query_feat = query_feat[objectness_mask]
+
     num_nodes = num_prototypes + query_feat.shape[0]
     n_classes = proto_labels.shape[-1]
     Y = torch.zeros(num_nodes, n_classes).cuda()
@@ -104,7 +118,73 @@ def get_label_propagation_loss(end_points, prototypes, proto_labels, sigma=1.0):
 
     pred_labels = end_points['sem_cls_scores'][unsupervised_inds, ...]
 
-    pred_labels = pred_labels.reshape(-1, pred_labels.shape[-1])
+    pred_labels = pred_labels.reshape(-1, pred_labels.shape[-1])[objectness_mask]
+
+    if config_dict['view_stats']:
+        # compute gt bboxes
+        # box_mask = end_points['box_label_mask'][unsupervised_inds, ...]
+        # box_indices = torch.nonzero(box_mask).long()
+        center_label = end_points['center_label'][unsupervised_inds, ...]
+        heading_class_label = end_points['heading_class_label'][unsupervised_inds, ...]
+        heading_residual_label = end_points['heading_residual_label'][unsupervised_inds, ...]
+        size_class_label = end_points['size_class_label'][unsupervised_inds, ...]
+        size_residual_label = end_points['size_residual_label'][unsupervised_inds, ...]
+
+        gt_size = config_dict['dataset_config'].class2size_gpu(size_class_label, size_residual_label)
+        gt_angle = config_dict['dataset_config'].class2angle_gpu(heading_class_label, heading_residual_label)
+        gt_bbox = torch.cat([center_label, gt_size, -gt_angle[:, :, None]], dim=2)
+
+        # compute pred bboxes
+        pred_center = end_points['center'][unsupervised_inds, ...] #(1, num_proposals, 3)
+        pred_size = end_points['size'][unsupervised_inds, ...]
+        pred_size[pred_size < 0] = 1e-6
+        pred_heading = end_points['heading'][unsupervised_inds, ...]
+
+        pred_bbox = torch.cat([pred_center, pred_size, -pred_heading[:, :, None]], axis=2)
+
+        pred_num = pred_bbox.shape[1]
+        gt_num = gt_bbox.shape[1]
+
+        # start = time.time()
+        gt_bbox_ = gt_bbox.view(-1, 7)
+        pred_bbox_ = pred_bbox.view(-1, 7)
+
+        # compute iou overlap for bboxes and assign each proposal to gt bbox
+        iou_labels = box3d_iou_batch_gpu(pred_bbox_, gt_bbox_)
+        iou_labels, object_assignment = iou_labels.view(batch_size * pred_num, batch_size, -1).max(dim=2)
+        inds = torch.arange(batch_size).cuda().unsqueeze(1).expand(-1, pred_num).contiguous().view(-1, 1)
+        iou_labels = iou_labels.gather(dim=1, index=inds).view(batch_size, -1)
+        iou_indices = iou_labels.view(-1) > iou_threshold
+        iou_labels = iou_labels.detach()
+        object_assignment = object_assignment.gather(dim=1, index=inds).view(batch_size, -1)
+
+        # combine indices with previous objectness mask
+        combined_indices = iou_indices & objectness_mask
+        combined_indices = combined_indices == True
+
+        iou_indices = iou_indices[objectness_mask]
+
+        # combined_indices = iou_indices
+
+        # batch set groundtruth indices to sem indices
+        sem_labels = end_points['sem_cls_label'][unsupervised_inds, ...]
+        gt_labels = sem_labels.gather(dim=1, index=object_assignment).view(-1)
+
+        # check correctness of pseudo labels
+        gt = gt_labels[combined_indices]
+        pseudo = pseudo_labels[iou_indices]
+        pseudo_correct = pseudo == gt
+        # pseudo_labels = pseudo_labels[iou_indices]
+        end_points['pseudo_correctness'] = torch.sum(pseudo_correct).detach().cpu().numpy() / pseudo.shape[0]
+
+        # check correctness of predicted sem labels
+        preds = torch.argmax(pred_labels, dim=-1)
+        pred = preds[iou_indices]
+        pred_correct = pred == gt
+        # preds = pred_labels[iou_indices]
+        end_points['pred_correctness'] = torch.sum(pred_correct).detach().cpu().numpy() / pred.shape[0]
+
+
 
     label_propagation_loss = F.cross_entropy(pred_labels, pseudo_labels)
     end_points['label_propagation_loss'] = label_propagation_loss

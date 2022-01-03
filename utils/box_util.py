@@ -13,7 +13,7 @@ from __future__ import print_function
 import numpy as np
 import numpy.testing as npt
 import torch
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, Delaunay
 
 try:
     from pcdet.ops.iou3d_nms.iou3d_nms_utils import boxes_iou3d_gpu
@@ -538,6 +538,16 @@ def check_valid_corners3d(corners_3d):
     except:
         print('\t\tWarning: this box is not a valid cube...')
         return False
+
+def in_hull(p, hull):
+    if not isinstance(hull,Delaunay):
+        hull = Delaunay(hull)
+    return hull.find_simplex(p)>=0
+
+def extract_pc_in_box3d(pc, box3d):
+    ''' pc: (N,3), box3d: (8,3) '''
+    box3d_roi_inds = in_hull(pc[:,0:3], box3d)
+    return pc[box3d_roi_inds,:], box3d_roi_inds
 
 
 if __name__ == '__main__':

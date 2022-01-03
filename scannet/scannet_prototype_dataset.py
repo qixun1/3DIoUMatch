@@ -17,13 +17,15 @@ import random
 import numpy as np
 from torch.utils.data import Dataset
 
-from visualize_votes_and_bboxes import visualise_indices
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.append(ROOT_DIR)
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
+sys.path.append(os.path.join(ROOT_DIR, 'scannet'))
 import pc_util
+# from viz_utils import visualise_indices
 from model_util_scannet import rotate_aligned_boxes
 
 from model_util_scannet import ScannetDatasetConfig
@@ -62,6 +64,8 @@ class ScannetPrototypeDataset(Dataset):
         self.use_height = use_height
         self.augment = augment
         self.remove_obj = remove_obj
+
+        self.dataset_config = ScannetDatasetConfig()
 
         # added
         self.raw_data_path = os.path.join(ROOT_DIR, 'scannet/meta_data')
@@ -110,152 +114,151 @@ class ScannetPrototypeDataset(Dataset):
         semantic_labels = np.load(os.path.join(self.data_path, scan_name)+'_sem_label.npy')
         instance_bboxes = np.load(os.path.join(self.data_path, scan_name)+'_bbox.npy')
 
-        if self.remove_obj:
-            if np.random.random() > 0.5 and instance_bboxes.shape[0]>=3:
-                #random remove an object
-                removed_box_ind = random.choice(list(range(0, instance_bboxes.shape[0])))
-                # NOTE: this assumes obj_id is in 1,2,3,.,,,.NUM_INSTANCES
-                removed_obj_ind = removed_box_ind + 1
-                removed_verts_inds = np.where(instance_labels==removed_obj_ind)[0]
-
-                instance_bboxes = np.delete(instance_bboxes, removed_box_ind, axis=0)
-                mesh_vertices = np.delete(mesh_vertices, removed_verts_inds, axis=0)
-                instance_labels = np.delete(instance_labels, removed_verts_inds, axis=0)
-                semantic_labels = np.delete(semantic_labels, removed_verts_inds, axis=0)
+        # if self.remove_obj:
+        #     if np.random.random() > 0.5 and instance_bboxes.shape[0]>=3:
+        #         #random remove an object
+        #         removed_box_ind = random.choice(list(range(0, instance_bboxes.shape[0])))
+        #         # NOTE: this assumes obj_id is in 1,2,3,.,,,.NUM_INSTANCES
+        #         removed_obj_ind = removed_box_ind + 1
+        #         removed_verts_inds = np.where(instance_labels==removed_obj_ind)[0]
+        #
+        #         instance_bboxes = np.delete(instance_bboxes, removed_box_ind, axis=0)
+        #         mesh_vertices = np.delete(mesh_vertices, removed_verts_inds, axis=0)
+        #         instance_labels = np.delete(instance_labels, removed_verts_inds, axis=0)
+        #         semantic_labels = np.delete(semantic_labels, removed_verts_inds, axis=0)
 
         if not self.use_color:
-            point_cloud = mesh_vertices[:,0:3] # do not use color for now
-            pcl_color = mesh_vertices[:,3:6]
+            point_cloud = mesh_vertices[:, 0:3]  # do not use color for now
         else:
-            point_cloud = mesh_vertices[:,0:6] 
-            point_cloud[:,3:] = (point_cloud[:,3:]-MEAN_COLOR_RGB)/256.0
-        
+            point_cloud = mesh_vertices[:, 0:6]
+            point_cloud[:, 3:] = (point_cloud[:, 3:] - MEAN_COLOR_RGB) / 256.0
+
         if self.use_height:
-            floor_height = np.percentile(point_cloud[:,2],0.99)
-            height = point_cloud[:,2] - floor_height
-            point_cloud = np.concatenate([point_cloud, np.expand_dims(height, 1)],1) 
+            floor_height = np.percentile(point_cloud[:, 2], 0.99)
+            height = point_cloud[:, 2] - floor_height
+            point_cloud = np.concatenate([point_cloud, np.expand_dims(height, 1)], 1)
             
         # ------------------------------- LABELS ------------------------------        
-        target_bboxes = np.zeros((MAX_NUM_OBJ, 6))
-        target_bboxes_mask = np.zeros((MAX_NUM_OBJ))
-        target_bboxes_semcls = np.zeros((MAX_NUM_OBJ))
-
-        target_bboxes_mask[0:instance_bboxes.shape[0]] = 1
-        target_bboxes[0:instance_bboxes.shape[0],:] = instance_bboxes[:,0:6]
-
-        class_ind = [np.where(DC.nyu40ids == x)[0][0] for x in instance_bboxes[:,-1]]
-        # NOTE: set size class as semantic class. Consider use size2class.
-
-        def in_hull(p, hull):
-            from scipy.spatial import Delaunay
-            if not isinstance(hull,Delaunay):
-                hull = Delaunay(hull)
-            return hull.find_simplex(p)>=0
-
-        def extract_pc_in_box3d(pc, box3d):
-            ''' pc: (N,3), box3d: (8,3) '''
-            box3d_roi_inds = in_hull(pc[:,0:3], box3d)
-            return pc[box3d_roi_inds,:], box3d_roi_inds
-
-        def rotz(t):
-            """Rotation about the z-axis."""
-            c = np.cos(t)
-            s = np.sin(t)
-            return np.array([[c, -s,  0],
-                             [s,  c,  0],
-                             [0,  0,  1]])
-
-        def my_compute_box_3d(center, size, heading_angle, scale=1.1):
-            R = rotz(-1*heading_angle)
-            l,w,h = size*0.5*scale
-            x_corners = [-l,l,l,-l,-l,l,l,-l]
-            y_corners = [w,w,-w,-w,w,w,-w,-w]
-            z_corners = [h,h,h,h,-h,-h,-h,-h]
-            corners_3d = np.dot(R, np.vstack([x_corners, y_corners, z_corners]))
-            corners_3d[0,:] += center[0]
-            corners_3d[1,:] += center[1]
-            corners_3d[2,:] += center[2]
-            return np.transpose(corners_3d)
-
-        bbox_point_idx = []
-        num_points = []
-
-        for id, gt in enumerate(instance_bboxes):
-            center = gt[:3]
-            size = gt[3:6]
-            corner_boxes = my_compute_box_3d(center, size, 0) # hardcode heading to 0
-            pc, pc_in_bbox = extract_pc_in_box3d(point_cloud, corner_boxes)
-            idx = np.nonzero(pc_in_bbox)[0]
-
-            bbox_point_idx.append(idx)
-            num_points.append(len(idx))
-            # visualise_indices(instance_bboxes, point_cloud, idx)
-        indices = np.concatenate(bbox_point_idx)
-        indices = np.unique(indices)
-
-
-        mask = np.zeros(point_cloud.shape[0])
-        mask[indices] = 1
-        unselected_indices = np.nonzero(1-mask)[0]
-
-        if self.num_points > len(indices):
-            pc2, choices = pc_util.random_sampling(point_cloud[unselected_indices], self.num_points - len(indices),
-                                               return_choices=True)
-            choices = np.array([unselected_indices[c] for c in choices])
-            choices = np.concatenate([indices, choices], 0)
-
-            point_cloud = point_cloud[choices]
-
-        else:
-            point_cloud, choices = pc_util.random_sampling(point_cloud[indices], self.num_points,
-                                                   return_choices=True)
-            choices = np.array([indices[c] for c in choices])
-            indices = choices
-        min_size = min(max(20, min(num_points)), 2048 // len(bbox_point_idx))
-
-        overall_indices = []
-        original_indices = []
-        realigned_indices = []
-        pc = point_cloud
-        for npoints in [2048, 1024]:
-            pcs = []
-            bbox_indices = []
-            index_list = []
-            for j, bbox in enumerate(bbox_point_idx):
-                if len(realigned_indices) == 0:
-                    index = np.array([np.where(indices==idx)[0][0] for idx in bbox if idx in choices])
-                else:
-                    index = realigned_indices[j]
-                pc2, new_choices = pc_util.random_sampling(pc[index], min_size,
-                                                          return_choices=True)
-                pcs.append(pc2)
-                new_choices = np.array([index[c] for c in new_choices])
-                # visualise_indices(instance_bboxes, pc, new_choices)
-                bbox_indices.append(new_choices)
-
-                index_list.append(list(range(j*len(new_choices), (j+1)*len(new_choices))))
-
-            original_indices.append(bbox_indices)
-
-            if npoints > min_size*(len(bbox_point_idx)):
-                len_p = len(pc)
-                len_i = len(indices)
-                if len(pc) > len(indices):
-                    pc2, new_choices = pc_util.random_sampling(pc[len(indices):], npoints - min_size*(len(bbox_point_idx)),
-                                                           return_choices=True)
-                else:
-                    pc2, new_choices = pc_util.random_sampling(pc[index], npoints - min_size*(len(bbox_point_idx)),
-                                                               return_choices=True)
-                    index_list[-1].extend(list(range(index_list[-1][-1], npoints)))
-                indices = np.concatenate(bbox_indices, 0)
-                pcs.append(pc2)
-                new_choices = np.array([c + len(indices) for c in new_choices])
-                bbox_indices.append(new_choices)
-            pc = np.concatenate(pcs, 0)
-            bbox_indices = np.concatenate(bbox_indices, 0)
-            realigned_indices = index_list
-            overall_indices.append(bbox_indices)
-            min_size //= 2
+        # target_bboxes = np.zeros((MAX_NUM_OBJ, 6))
+        # target_bboxes_mask = np.zeros((MAX_NUM_OBJ))
+        # target_bboxes_semcls = np.zeros((MAX_NUM_OBJ))
+        #
+        # target_bboxes_mask[0:instance_bboxes.shape[0]] = 1
+        # target_bboxes[0:instance_bboxes.shape[0],:] = instance_bboxes[:,0:6]
+        #
+        # class_ind = [np.where(self.dataset_config.nyu40ids == x)[0][0] for x in instance_bboxes[:,-1]]
+        # # NOTE: set size class as semantic class. Consider use size2class.
+        #
+        # def in_hull(p, hull):
+        #     from scipy.spatial import Delaunay
+        #     if not isinstance(hull,Delaunay):
+        #         hull = Delaunay(hull)
+        #     return hull.find_simplex(p)>=0
+        #
+        # def extract_pc_in_box3d(pc, box3d):
+        #     ''' pc: (N,3), box3d: (8,3) '''
+        #     box3d_roi_inds = in_hull(pc[:,0:3], box3d)
+        #     return pc[box3d_roi_inds,:], box3d_roi_inds
+        #
+        # def rotz(t):
+        #     """Rotation about the z-axis."""
+        #     c = np.cos(t)
+        #     s = np.sin(t)
+        #     return np.array([[c, -s,  0],
+        #                      [s,  c,  0],
+        #                      [0,  0,  1]])
+        #
+        # def my_compute_box_3d(center, size, heading_angle, scale=1.1):
+        #     R = rotz(-1*heading_angle)
+        #     l,w,h = size*0.5*scale
+        #     x_corners = [-l,l,l,-l,-l,l,l,-l]
+        #     y_corners = [w,w,-w,-w,w,w,-w,-w]
+        #     z_corners = [h,h,h,h,-h,-h,-h,-h]
+        #     corners_3d = np.dot(R, np.vstack([x_corners, y_corners, z_corners]))
+        #     corners_3d[0,:] += center[0]
+        #     corners_3d[1,:] += center[1]
+        #     corners_3d[2,:] += center[2]
+        #     return np.transpose(corners_3d)
+        #
+        # bbox_point_idx = []
+        # num_points = []
+        #
+        # for id, gt in enumerate(instance_bboxes):
+        #     center = gt[:3]
+        #     size = gt[3:6]
+        #     corner_boxes = my_compute_box_3d(center, size, 0) # hardcode heading to 0
+        #     pc, pc_in_bbox = extract_pc_in_box3d(point_cloud, corner_boxes)
+        #     idx = np.nonzero(pc_in_bbox)[0]
+        #
+        #     bbox_point_idx.append(idx)
+        #     num_points.append(len(idx))
+        #     # visualise_indices(instance_bboxes, point_cloud, idx)
+        # indices = np.concatenate(bbox_point_idx)
+        # indices = np.unique(indices)
+        #
+        #
+        # mask = np.zeros(point_cloud.shape[0])
+        # mask[indices] = 1
+        # unselected_indices = np.nonzero(1-mask)[0]
+        #
+        # if self.num_points > len(indices):
+        #     pc2, choices = pc_util.random_sampling(point_cloud[unselected_indices], self.num_points - len(indices),
+        #                                        return_choices=True)
+        #     choices = np.array([unselected_indices[c] for c in choices])
+        #     choices = np.concatenate([indices, choices], 0)
+        #
+        #     point_cloud = point_cloud[choices]
+        #
+        # else:
+        #     point_cloud, choices = pc_util.random_sampling(point_cloud[indices], self.num_points,
+        #                                            return_choices=True)
+        #     choices = np.array([indices[c] for c in choices])
+        #     indices = choices
+        # min_size = min(max(20, min(num_points)), 2048 // len(bbox_point_idx))
+        #
+        # overall_indices = []
+        # original_indices = []
+        # realigned_indices = []
+        # pc = point_cloud
+        # for npoints in [2048, 1024]:
+        #     pcs = []
+        #     bbox_indices = []
+        #     index_list = []
+        #     for j, bbox in enumerate(bbox_point_idx):
+        #         if len(realigned_indices) == 0:
+        #             index = np.array([np.where(indices==idx)[0][0] for idx in bbox if idx in choices])
+        #         else:
+        #             index = realigned_indices[j]
+        #         pc2, new_choices = pc_util.random_sampling(pc[index], min_size,
+        #                                                   return_choices=True)
+        #         pcs.append(pc2)
+        #         new_choices = np.array([index[c] for c in new_choices])
+        #         # visualise_indices(instance_bboxes, pc, new_choices)
+        #         bbox_indices.append(new_choices)
+        #
+        #         index_list.append(list(range(j*len(new_choices), (j+1)*len(new_choices))))
+        #
+        #     original_indices.append(bbox_indices)
+        #
+        #     if npoints > min_size*(len(bbox_point_idx)):
+        #         len_p = len(pc)
+        #         len_i = len(indices)
+        #         if len(pc) > len(indices):
+        #             pc2, new_choices = pc_util.random_sampling(pc[len(indices):], npoints - min_size*(len(bbox_point_idx)),
+        #                                                    return_choices=True)
+        #         else:
+        #             pc2, new_choices = pc_util.random_sampling(pc[index], npoints - min_size*(len(bbox_point_idx)),
+        #                                                        return_choices=True)
+        #             index_list[-1].extend(list(range(index_list[-1][-1], npoints)))
+        #         indices = np.concatenate(bbox_indices, 0)
+        #         pcs.append(pc2)
+        #         new_choices = np.array([c + len(indices) for c in new_choices])
+        #         bbox_indices.append(new_choices)
+        #     pc = np.concatenate(pcs, 0)
+        #     bbox_indices = np.concatenate(bbox_indices, 0)
+        #     realigned_indices = index_list
+        #     overall_indices.append(bbox_indices)
+        #     min_size //= 2
 
 
 
@@ -303,14 +306,25 @@ class ScannetPrototypeDataset(Dataset):
         #             bbox_indices.append(new_choices)
         #         overall_indices.append(bbox_indices)
 
-        target_bboxes_semcls[0:instance_bboxes.shape[0]] = class_ind
-            
+        # target_bboxes_semcls[0:instance_bboxes.shape[0]] = class_ind
+        point_cloud = pc_util.random_sampling(point_cloud, self.num_points, return_choices=False)
+        num_seen_bboxes = instance_bboxes.shape[0]
+        seen_bboxes_params = np.zeros((num_seen_bboxes, 7))
+        seen_bboxes_params[:num_seen_bboxes, :6] = instance_bboxes[:, :6]
+        seen_bboxes_cls_label = np.array([self.dataset_config.nyu40id2class[x] for x in instance_bboxes[:, -1]])
+        seen_bboxes_cls_name = np.array([self.dataset_config.class2type[x] for x in seen_bboxes_cls_label])
+
+
         ret_dict = {}
         ret_dict['point_clouds'] = point_cloud.astype(np.float32)
-        ret_dict['sem_cls_label'] = target_bboxes_semcls.astype(np.int64)
-        ret_dict['realigned_indices'] = realigned_indices
-        ret_dict['overall_indices'] = overall_indices
-        ret_dict['original_indices'] = original_indices
+        # ret_dict['sem_cls_label'] = target_bboxes_semcls.astype(np.int64)
+        # ret_dict['realigned_indices'] = realigned_indices
+        # ret_dict['overall_indices'] = overall_indices
+        # ret_dict['original_indices'] = original_indices
+        ret_dict['bboxes_param'] = seen_bboxes_params
+        ret_dict['bboxes_cls_label'] = seen_bboxes_cls_label
+        ret_dict['bboxes_cls_name'] = seen_bboxes_cls_name
+        ret_dict['scan_name'] = scan_name
         ret_dict['bboxes'] = instance_bboxes
 
         return ret_dict
@@ -324,10 +338,10 @@ class ScannetPrototypeDataset(Dataset):
             # randomly select scan names w.r.t labeled_ratio
             num_scans = len(self.scan_names)
             num_labeled_scans = int(self.labeled_ratio * num_scans)
-            scan2label = np.zeros((num_scans, DC.num_class))
+            scan2label = np.zeros((num_scans, self.dataset_config.num_class))
             for i, scan_name in enumerate(self.scan_names):
                 instance_bboxes = np.load(os.path.join(self.data_path, scan_name) + '_bbox.npy')
-                class_ind = [DC.nyu40id2class[x] for x in instance_bboxes[:, -1]]
+                class_ind = [self.dataset_config.nyu40id2class[x] for x in instance_bboxes[:, -1]]
                 if class_ind != []:
                     unique_class_ind = list(set(class_ind))
                 else: continue
@@ -338,7 +352,7 @@ class ScannetPrototypeDataset(Dataset):
                 choices = np.random.choice(num_scans, num_labeled_scans, replace=False)
                 class_distr = np.sum(scan2label[choices], axis=0)
                 class_mask = np.where(class_distr>0, 1, 0)
-                if np.sum(class_mask) == DC.num_class:
+                if np.sum(class_mask) == self.dataset_config.num_class:
                     labeled_scan_names = list(np.array(self.scan_names)[choices])
                     with open(os.path.join(ROOT_DIR, 'scannet/meta_data/scannetv2_train_{}.txt'.format(self.labeled_ratio)), 'w') as f:
                         for scan_name in labeled_scan_names:

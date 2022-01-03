@@ -22,7 +22,7 @@ from models.loss_helper_label_propagation import get_label_propagation_loss
 from models.votenet_iou_branch import VoteNet
 import utils.ramps as ramps
 from scannet.scannet_prototype_dataset import ScannetPrototypeDataset
-from visualize_votes_and_bboxes import visualize_votes
+from utils.vis_utils import visualize_votes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -66,10 +66,12 @@ parser.add_argument('--ema_decay', type=float, default=0.999, metavar='ALPHA',
                     help='ema variable decay rate')
 parser.add_argument('--unlabeled_loss_weight', type=float, default=2.0, metavar='WEIGHT',
                     help='use unlabeled loss with given weight')
-parser.add_argument('--consistency_weight', type=float, default=10.0, metavar='WEIGHT',
+parser.add_argument('--consistency_weight', type=float, default=10.0,
                     help='use consistency loss with given weight (default: None)')
 parser.add_argument('--consistency_rampup', type=int, default=30, metavar='EPOCHS',
                     help='length of the consistency loss ramp-up')
+parser.add_argument('--dist_threshold', type=float, default=0.01,
+                    help='ignore points which have center distance more than threshold')
 parser.add_argument('--sigma', type=float, default=1.0, help='sigma for label propagation')
 parser.add_argument('--proto_file', default='proto.pt', help='location to load/store prototypes')
 parser.add_argument('--use_clustering', action='store_true', help='use clustering to obtain prototypes')
@@ -95,6 +97,7 @@ STUDENT = FLAGS.use_student
 NUM_POINT = FLAGS.num_point
 MAX_EPOCH = FLAGS.max_epoch
 sigma = FLAGS.sigma
+dist_threshold = FLAGS.dist_threshold
 BASE_LEARNING_RATE = FLAGS.learning_rate
 BN_DECAY_STEP = FLAGS.bn_decay_step
 BN_DECAY_RATE = FLAGS.bn_decay_rate
@@ -492,6 +495,7 @@ def train_one_epoch(global_step, prototypes=None, proto_labels=None):
     detector.train()  # set model to training mode
     ema_detector.train()
     consistency_weight = get_current_consistency_weight(EPOCH_CNT)
+    # label_propagation_weight = 1.0
 
     unlabeled_dataloader_iterator = iter(UNLABELED_DATALOADER)
 
@@ -532,15 +536,18 @@ def train_one_epoch(global_step, prototypes=None, proto_labels=None):
         # unlabeled_loss, end_points = train_unlabeled_criterion(end_points, ema_end_points, DATASET_CONFIG, CONFIG_DICT)
 
         # TODO: add consistency loss here unlabelled data and let the weight be an argument
-        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
-        # consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT)
+        # consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG)
+        consistency_loss, end_points = get_consistency_loss(end_points, ema_end_points, DATASET_CONFIG, STUDENT,
+                                                            dist_threshold)
 
         # TODO: add label propagation here using the global prototypes
-        label_propagation_loss, end_points = get_label_propagation_loss(end_points, prototypes, proto_labels, sigma)
+        # label_propagation_loss, end_points = get_label_propagation_loss(end_points, prototypes, proto_labels,
+        #                                                                 CONFIG_DICT, sigma)
         # TODO: add pairwise loss on unlabelled data
 
-        # loss = detection_loss + consistency_loss * consistency_weight
-        loss = detection_loss + consistency_loss * consistency_weight + label_propagation_loss
+        end_points['consistency_loss'] = consistency_loss * consistency_weight
+        loss = detection_loss + consistency_loss * consistency_weight
+        # loss = detection_loss + consistency_loss * consistency_weight + label_propagation_loss * label_propagation_weight
         # loss = detection_loss + unlabeled_loss * FLAGS.unlabeled_loss_weight
         end_points['loss'] = loss
         loss.backward()
@@ -754,6 +761,32 @@ def train():
     start_from = 0
     if FLAGS.resume:
         start_from = start_epoch
+
+    if not os.path.isfile(PROTO_FILE):
+        prototypes, proto_labels = get_prototypes(detector)
+        torch.save({'prototypes': prototypes, 'proto_labels': proto_labels}, PROTO_FILE)
+    else:
+        obj = torch.load(PROTO_FILE)
+        # prototypes = torch.from_numpy(obj['prototypes']).to(device)
+        # proto_labels = torch.from_numpy(obj['proto_labels']).to(device)
+        prototypes = []
+        proto_labels = []
+        original_prototypes = obj['prototypes']
+        original_proto_labels = obj['proto_labels']
+        labels = set(obj['proto_labels'])
+        proto_dict = {label: np.where(original_proto_labels == label) for label in labels}
+        for cls, inds in proto_dict.items():
+            feats = torch.from_numpy(original_prototypes[inds]).to(device)
+            prototype = feats
+
+            prototypes.append(prototype)
+            num_prototypes = prototype.shape[0]
+            class_labels = torch.zeros(num_prototypes, len(proto_dict))
+            class_labels[:, cls] = 1
+            proto_labels.append(class_labels)
+        prototypes = torch.cat(prototypes, dim=0)
+        proto_labels = torch.cat(proto_labels, dim=0)
+
     for epoch in range(start_from, MAX_EPOCH):
         EPOCH_CNT = epoch
         log_string('\n**** EPOCH %03d, STEP %d ****' % (epoch, global_step))
@@ -766,13 +799,7 @@ def train():
         # in numpy 1.18.5 this actually sets `np.random.get_state()[1][0]` to default value
         # so the test data is consistent as the initial seed is the same
         np.random.seed()
-        if not os.path.isfile(PROTO_FILE):
-            prototypes, proto_labels = get_prototypes(detector)
-            torch.save({'prototypes': prototypes, 'proto_labels': proto_labels}, PROTO_FILE)
-        else:
-            obj = torch.load(PROTO_FILE)
-            prototypes = obj['prototypes']
-            proto_labels = obj['proto_labels']
+
         global_step = train_one_epoch(global_step, prototypes, proto_labels)
         # global_step = train_one_epoch(global_step)
         map = 0.0

@@ -10,9 +10,17 @@ Author: Charles R. Qi and Or Litany
 
 # Modified by Yezhen Cong, 2020
 
+import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+sys.path.append(os.path.join(ROOT_DIR, 'utils'))
+from box_util import get_3d_box_depth, extract_pc_in_box3d
 
 from models.backbone_module import Pointnet2Backbone
 from models.grid_conv_module import GridConv
@@ -135,6 +143,49 @@ class VoteNet(nn.Module):
         end_points['size'] = size
         end_points['heading'] = heading
         return center, size, heading
+
+    def generate_proposal_features(self, input_dict, front=False):
+        end_points = {}
+        end_points = self.backbone_net(input_dict['point_cloud'], end_points)
+        xyz, features = self.vgen(end_points['fp2_xyz'], end_points['fp2_features'])
+        features_norm = torch.norm(features, p=2, dim=1)
+        features = features.div(features_norm.unsqueeze(1))
+        end_points['vote_xyz'] = xyz
+        end_points['vote_features'] = features
+        sampled_points = end_points['vote_xyz'].squeeze(0).detach().cpu().numpy()  # TODO: use seed_xyz?
+
+        instance_features = []
+        instance_cls_labels = []
+        instance_cls_names = []
+        for i, bbox in enumerate(input_dict['bboxes_param']):
+            corner_boxes = get_3d_box_depth(bbox[3:6], -bbox[6], bbox[0:3])
+            pc, pc_in_bbox = extract_pc_in_box3d(sampled_points, corner_boxes)
+            if pc.shape[0] == 0:
+                print('Skip %d-th bbox (%s) in %s.' %(i, input_dict['bboxes_cls_name'][i], input_dict['scan_name']))
+                continue
+            idx = np.nonzero(pc_in_bbox)[0]
+            # group points within one bbox
+            grouped_features = end_points['vote_features'][:,:,idx] #(1, C, n), C denotes vote_feat_dim, n denotes num_points_in_bbox
+            grouped_xyz = end_points['vote_xyz'][:,idx,:].transpose(1,2) #(1, 3, n)
+            grouped_features = torch.cat((grouped_xyz, grouped_features), dim=1) #(1, C+3, n)
+            new_features = self.pnet.vote_aggregation.mlp_module(grouped_features.unsqueeze(2)) # (1, C+3, 1, n) -> (1, mlp[-1], 1, n)
+            new_features = F.max_pool2d(new_features, kernel_size=[1, new_features.size(3)])  # (1, mlp[-1], 1, 1)
+            new_features = new_features.squeeze(-1)  # (1, mlp[-1], 1)
+            instance_features.append(new_features)
+            instance_cls_labels.append(input_dict['bboxes_cls_label'][i])
+            instance_cls_names.append(input_dict['bboxes_cls_name'][i])
+
+        if len(instance_features) == 0:
+            return None, None, None
+        instance_features = torch.cat(instance_features, dim=-1) # (1, mlp[-1], num_instances)
+        if front:
+            instance_features = instance_features.squeeze(0).transpose(0,1) # (num_instances, mlp[-1])
+            return instance_features, instance_cls_labels, instance_cls_names
+        instance_features = F.relu(self.pnet.bn1(self.pnet.conv1(instance_features)))
+        instance_features = F.relu(self.pnet.bn2(self.pnet.conv2(instance_features)))
+        # instance_features = self.pnet.mlp_module(instance_features)
+        instance_features = instance_features.squeeze(0).transpose(0,1) # (num_instances, mlp[-1])
+        return instance_features, instance_cls_labels, instance_cls_names
 
     def forward(self, inputs, iou_opt=False):
         end_points = self.forward_backbone(inputs)

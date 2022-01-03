@@ -29,18 +29,16 @@ def compute_center_consistency_loss(end_points, ema_end_points, student_weights=
     dist1, ind1, dist2, ind2 = nn_distance(center,
                                            ema_center)  # ind1 (B, num_proposal): ema_center index closest to center
 
-    # TODO: weigh the unlabelled distances according to values
     if student_weights is not None and ema_weights is not None:
         dist1 = student_weights * dist1
         dist2 = ema_weights * dist2
     # use ema weights for the dist2 and student weights for dist 1 on both fully labelled and unlabelled data
 
-    # TODO: use both dist1 and dist2 or only use dist1
     dist = dist1 + dist2
 
     if student:
-        return torch.mean(dist), ind1
-    return torch.mean(dist), ind2
+        return torch.mean(dist), ind1, dist1
+    return torch.mean(dist), ind2, dist2
 
 
 
@@ -122,7 +120,7 @@ def weighted_mse_loss(input, target, weight):
     return (weight * (input - target) ** 2).mean()
 
 
-def get_consistency_loss(end_points, ema_end_points, config, student=False):
+def get_consistency_loss(end_points, ema_end_points, config, student=False, dist_threshold=0.01):
     """
     Args:
         end_points: dict
@@ -173,22 +171,22 @@ def get_consistency_loss(end_points, ema_end_points, config, student=False):
     class_ema_weight = objectness_ema * max_cls_ema
     size_ema_weight = objectness_ema * iou_pred_ema
 
-    center_consistency_loss, map_ind = compute_center_consistency_loss(end_points, ema_end_points,
+    center_consistency_loss, map_ind, dist = compute_center_consistency_loss(end_points, ema_end_points,
                                                                        centre_student_weight, centre_ema_weight, student)
-    if student:
-        # still use ema weights
-        class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight)
-        size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight)
-    else:
-        class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight)
-        # class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind)
-        size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight)
+
+    # TODO: set weights to 0 if dist is more than threshold and only weigh if distance is less than threshold:
+    class_ema_weight[dist > dist_threshold] = 0
+    size_ema_weight[dist > dist_threshold] = 0
+
+    class_consistency_loss = compute_class_consistency_loss(end_points, ema_end_points, map_ind, class_ema_weight, student)
+    size_consistency_loss = compute_size_consistency_loss(end_points, ema_end_points, map_ind, config, size_ema_weight, student)
+
 
     consistency_loss = center_consistency_loss + class_consistency_loss + size_consistency_loss
 
     end_points['center_consistency_loss'] = center_consistency_loss
     end_points['class_consistency_loss'] = class_consistency_loss
     end_points['size_consistency_loss'] = size_consistency_loss
-    end_points['consistency_loss'] = consistency_loss
+
 
     return consistency_loss, end_points
